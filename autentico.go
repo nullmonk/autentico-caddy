@@ -3,6 +3,7 @@ package autentico
 import (
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -27,6 +28,7 @@ type Autentico struct {
 	ServerName    string   `json:"server_name,omitempty"`
 	AllowedGroups []string `json:"allowed_groups,omitempty"`
 	CallbackPath  string   `json:"callback_path,omitempty"`
+	MTLS          string   `json:"mtls,omitempty"` // optional, require, both
 
 	app    *App
 	logger *zap.Logger
@@ -99,7 +101,36 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		return a.handleCallback(w, r, state, oauthConfig)
 	}
 
-	// Extract token
+	// MTLS Validation logic
+	var mtlsUsername string
+	var mtlsCertSerial string
+	mtlsValid := false
+
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		clientCert := r.TLS.PeerCertificates[0]
+
+		state.mu.Lock()
+		pool := state.CertPool
+		state.mu.Unlock()
+
+		if pool != nil {
+			opts := x509.VerifyOptions{
+				Roots:     pool,
+				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			}
+			if _, err := clientCert.Verify(opts); err == nil {
+				mtlsValid = true
+				mtlsUsername = clientCert.Subject.CommonName
+				mtlsCertSerial = clientCert.SerialNumber.String()
+			} else {
+				a.logger.Debug("mtls verification failed", zap.Error(err))
+			}
+		} else {
+			a.logger.Warn("mtls CA pool is not initialized")
+		}
+	}
+
+	// Extract Bearer token
 	token := ""
 	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 		token = strings.TrimPrefix(authHeader, "Bearer ")
@@ -107,8 +138,51 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		token = cookie.Value
 	}
 
-	// If no token, start OAuth2 flow (unless API client, then return 401)
-	if token == "" {
+	tokenValid := token != ""
+
+	// Determine authentication state based on mode
+	mtlsReq := a.MTLS
+	if mtlsReq == "" {
+		mtlsReq = "none" // default to disabled
+	}
+
+	// If MTLS is required and invalid, fail early
+	if (mtlsReq == "require" || mtlsReq == "both") && !mtlsValid {
+		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("mtls required"))
+	}
+
+	// If MTLS mode is "require", we don't need token valid
+	// If "both", we need both
+	// If "optional", we need at least one
+	var authMethod string
+	var groups []string
+
+	if mtlsReq == "require" {
+		authMethod = "mtls"
+	} else if mtlsReq == "both" {
+		if !tokenValid {
+			// Start OAuth flow for missing token
+			authMethod = "missing_token"
+		} else {
+			authMethod = "both" // We will fetch groups using the token later.
+		}
+	} else if mtlsReq == "optional" {
+		if tokenValid {
+			authMethod = "token"
+		} else if mtlsValid {
+			authMethod = "mtls"
+		} else {
+			authMethod = "missing_token"
+		}
+	} else { // mtlsReq == "none"
+		if tokenValid {
+			authMethod = "token"
+		} else {
+			authMethod = "missing_token"
+		}
+	}
+
+	if authMethod == "missing_token" {
 		if !strings.Contains(r.Header.Get("Accept"), "text/html") {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="autentico"`)
 			return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
@@ -131,40 +205,89 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		return nil
 	}
 
-	// Validate token and check groups
-	// 1. Check cache first
-	groups, ok := a.app.GetCachedGroups(token)
-	if !ok {
-		// 2. Fetch UserInfo from OIDC provider
-		oauth2Token := &oauth2.Token{
-			AccessToken: token,
-			TokenType:   "Bearer",
+	// Fetch groups
+	if authMethod == "mtls" {
+		// Use MTLS cert to fetch groups
+		cacheKey := fmt.Sprintf("mtls:%s:%s", mtlsCertSerial, a.ServerName)
+		if cachedGroups, ok := a.app.GetCachedGroups(cacheKey); ok {
+			groups = cachedGroups
+		} else {
+			fetchedGroups, err := a.app.LookupUserGroups(r.Context(), a.ServerName, mtlsUsername)
+			if err != nil {
+				a.logger.Warn("failed to fetch user groups via mtls", zap.Error(err), zap.String("username", mtlsUsername))
+				return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid mtls user"))
+			}
+			groups = fetchedGroups
+			a.app.SetCachedGroups(cacheKey, groups, 5*time.Minute)
 		}
-		userInfo, err := state.Provider.UserInfo(r.Context(), oauth2.StaticTokenSource(oauth2Token))
-		if err != nil {
-			a.logger.Warn("failed to fetch userinfo", zap.Error(err))
-			// Token might be invalid/expired, clear cookie if it came from one
-			http.SetCookie(w, &http.Cookie{
-				Name:     "autentico_token",
-				Value:    "",
-				Path:     "/",
-				Expires:  time.Unix(0, 0),
-				HttpOnly: true,
-			})
-			return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid token"))
+	} else if authMethod == "token" || authMethod == "both" {
+		// Use Token to fetch groups
+		var tokenGroups []string
+		if cachedGroups, ok := a.app.GetCachedGroups(token); ok {
+			tokenGroups = cachedGroups
+		} else {
+			// Fetch UserInfo from OIDC provider
+			oauth2Token := &oauth2.Token{
+				AccessToken: token,
+				TokenType:   "Bearer",
+			}
+			userInfo, err := state.Provider.UserInfo(r.Context(), oauth2.StaticTokenSource(oauth2Token))
+			if err != nil {
+				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
+				// Token might be invalid/expired, clear cookie if it came from one
+				http.SetCookie(w, &http.Cookie{
+					Name:     "autentico_token",
+					Value:    "",
+					Path:     "/",
+					Expires:  time.Unix(0, 0),
+					HttpOnly: true,
+				})
+				return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid token"))
+			}
+
+			var claims struct {
+				Groups []string `json:"groups"`
+			}
+			if err := userInfo.Claims(&claims); err != nil {
+				a.logger.Error("failed to unmarshal userinfo claims", zap.Error(err))
+				return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("invalid userinfo response"))
+			}
+			tokenGroups = claims.Groups
+
+			// Cache it
+			a.app.SetCachedGroups(token, tokenGroups, 5*time.Minute)
 		}
 
-		var claims struct {
-			Groups []string `json:"groups"`
-		}
-		if err := userInfo.Claims(&claims); err != nil {
-			a.logger.Error("failed to unmarshal userinfo claims", zap.Error(err))
-			return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("invalid userinfo response"))
-		}
-		groups = claims.Groups
+		if authMethod == "token" {
+			groups = tokenGroups
+		} else if authMethod == "both" {
+			// Merge groups from MTLS and Token
+			var mtlsGroups []string
+			cacheKey := fmt.Sprintf("mtls:%s:%s", mtlsCertSerial, a.ServerName)
+			if cachedGroups, ok := a.app.GetCachedGroups(cacheKey); ok {
+				mtlsGroups = cachedGroups
+			} else {
+				fetchedGroups, err := a.app.LookupUserGroups(r.Context(), a.ServerName, mtlsUsername)
+				if err != nil {
+					a.logger.Warn("failed to fetch user groups via mtls", zap.Error(err), zap.String("username", mtlsUsername))
+					return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid mtls user"))
+				}
+				mtlsGroups = fetchedGroups
+				a.app.SetCachedGroups(cacheKey, mtlsGroups, 5*time.Minute)
+			}
 
-		// Cache it
-		a.app.SetCachedGroups(token, groups, 5*time.Minute)
+			// Deduplicate merged groups
+			groupMap := make(map[string]bool)
+			for _, g := range tokenGroups {
+				groupMap[g] = true
+			}
+			for _, g := range mtlsGroups {
+				groupMap[g] = true
+			}
+			for g := range groupMap {
+				groups = append(groups, g)
+			}
+		}
 	}
 
 	// 3. Check if user's groups match allowed groups
@@ -294,6 +417,15 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				a.ServerName = d.Val()
+			case "mtls":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				val := d.Val()
+				if val != "optional" && val != "require" && val != "both" {
+					return d.Errf("invalid mtls mode: %s", val)
+				}
+				a.MTLS = val
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
 			}

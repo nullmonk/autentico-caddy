@@ -1,9 +1,12 @@
 package autentico
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -26,6 +29,7 @@ type ServerState struct {
 	Provider *oidc.Provider
 	Config   oauth2.Config
 	Verifier *oidc.IDTokenVerifier
+	CertPool *x509.CertPool
 	mu       sync.Mutex
 }
 
@@ -126,6 +130,62 @@ func (a *App) SetCachedGroups(token string, groups []string, ttl time.Duration) 
 	})
 }
 
+// LookupUserGroups fetches user groups from the Autentico admin API
+func (a *App) LookupUserGroups(ctx context.Context, serverName, username string) ([]string, error) {
+	config, ok := a.Servers[serverName]
+	if !ok {
+		return nil, fmt.Errorf("server configuration %q not found", serverName)
+	}
+	if config.APIToken == "" {
+		return nil, fmt.Errorf("APIToken is required for MTLS group resolution")
+	}
+
+	payload := map[string]interface{}{
+		"usernames": []string{username},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal lookup request: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", config.URL+"/admin/api/users/lookup", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create lookup request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+config.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("lookup request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lookup request returned status %s", resp.Status)
+	}
+
+	var result struct {
+		Data struct {
+			Items []struct {
+				Username string   `json:"username"`
+				Groups   []string `json:"groups"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode lookup response: %v", err)
+	}
+
+	if len(result.Data.Items) == 0 {
+		return nil, fmt.Errorf("user not found")
+	}
+
+	return result.Data.Items[0].Groups, nil
+}
+
 // Start implementing caddy.App
 func (a *App) Start() error {
 	// Simple health check at caddy start up
@@ -135,6 +195,7 @@ func (a *App) Start() error {
 			config := serverConfig
 			// Run in a background goroutine so it doesn't block Caddy's start up
 			go func() {
+				// 1. Health check
 				req, err := http.NewRequest("GET", config.URL+"/healthz", nil)
 				if err != nil {
 					a.logger.Error("failed to create autentico health check request", zap.Error(err), zap.String("server", name))
@@ -163,6 +224,41 @@ func (a *App) Start() error {
 				}
 
 				a.logger.Info("autentico health check successful", zap.String("server", name))
+
+				// 2. Fetch CA chain for MTLS
+				caReq, err := http.NewRequest("GET", config.URL+"/ca.crt", nil)
+				if err != nil {
+					a.logger.Error("failed to create ca.crt request", zap.Error(err), zap.String("server", name))
+					return
+				}
+				caResp, err := client.Do(caReq)
+				if err != nil {
+					a.logger.Error("failed to fetch ca.crt", zap.Error(err), zap.String("server", name))
+					return
+				}
+				defer caResp.Body.Close()
+
+				if caResp.StatusCode == http.StatusOK {
+					caBytes, err := io.ReadAll(caResp.Body)
+					if err != nil {
+						a.logger.Error("failed to read ca.crt response", zap.Error(err), zap.String("server", name))
+						return
+					}
+
+					pool := x509.NewCertPool()
+					if ok := pool.AppendCertsFromPEM(caBytes); !ok {
+						a.logger.Error("failed to parse ca.crt PEM", zap.String("server", name))
+						return
+					}
+
+					state := a.serverStates[name]
+					state.mu.Lock()
+					state.CertPool = pool
+					state.mu.Unlock()
+					a.logger.Info("autentico CA chain loaded successfully", zap.String("server", name))
+				} else {
+					a.logger.Warn("failed to fetch ca.crt, mtls might not work", zap.String("status", caResp.Status), zap.String("server", name))
+				}
 			}()
 		}
 	}
