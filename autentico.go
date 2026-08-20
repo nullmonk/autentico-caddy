@@ -58,6 +58,18 @@ func (a *Autentico) Provision(ctx caddy.Context) error {
 	}
 	a.app = app.(*App)
 
+	if a.MTLS == "require" || a.MTLS == "optional" || a.MTLS == "both" {
+		a.app.RegisterFeature(a.ServerName, "mtls")
+	}
+
+	if len(a.AllowedGroups) > 0 {
+		a.app.RegisterFeature(a.ServerName, "groups")
+	}
+
+	if a.MTLS == "" || a.MTLS == "none" || a.MTLS == "optional" || a.MTLS == "both" {
+		a.app.RegisterFeature(a.ServerName, "oidc")
+	}
+
 	return nil
 }
 
