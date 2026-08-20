@@ -29,7 +29,6 @@ type Autentico struct {
 	AllowedGroups []string `json:"allowed_groups,omitempty"`
 	CallbackPath  string   `json:"callback_path,omitempty"`
 	MTLS          string   `json:"mtls,omitempty"` // optional, require, both
-	CookieDomain  string   `json:"cookie_domain,omitempty"`
 
 	app    *App
 	logger *zap.Logger
@@ -409,7 +408,6 @@ func (a *Autentico) handleCallback(w http.ResponseWriter, r *http.Request, state
 		HttpOnly: true,
 		Secure:   scheme == "https",
 		MaxAge:   maxAge,
-		Domain:   a.CookieDomain,
 	})
 
 	http.Redirect(w, r, originalURL, http.StatusFound)
@@ -459,11 +457,6 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid mtls mode: %s", val)
 				}
 				a.MTLS = val
-			case "cookie_domain":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				a.CookieDomain = d.Val()
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
 			}

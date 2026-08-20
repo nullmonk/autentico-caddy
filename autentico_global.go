@@ -3,11 +3,16 @@ package autentico
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +36,8 @@ type ServerState struct {
 	Verifier *oidc.IDTokenVerifier
 	CertPool *x509.CertPool
 	mu       sync.Mutex
+
+	RedirectURIs []string
 }
 
 // ServerConfig defines the configuration for an autentico server
@@ -208,6 +215,68 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 	return result.Data.Items[0].Groups, nil
 }
 
+// RegisterRedirectURI dynamically registers a new callback URL for the OIDC client
+func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL string) error {
+	config, ok := a.Servers[serverName]
+	if !ok {
+		return fmt.Errorf("server configuration %q not found", serverName)
+	}
+
+	state, ok := a.serverStates[serverName]
+	if !ok {
+		return fmt.Errorf("server state %q not found", serverName)
+	}
+
+	clientID := config.ClientID
+	if clientID == "" {
+		clientID = "caddy.plugin.autentico"
+	}
+
+	state.mu.Lock()
+	// Double-check under lock
+	for _, u := range state.RedirectURIs {
+		if u == callbackURL {
+			state.mu.Unlock()
+			return nil
+		}
+	}
+
+	// Optimistically append to cache immediately so concurrent requests don't all trigger this
+	state.RedirectURIs = append(state.RedirectURIs, callbackURL)
+	currentURIs := make([]string, len(state.RedirectURIs))
+	copy(currentURIs, state.RedirectURIs)
+	state.mu.Unlock()
+
+	payload := map[string]interface{}{
+		"redirect_uris": currentURIs,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal redirect_uris update: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", config.URL+"/admin/api/clients/"+clientID, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create client update request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+config.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("client update request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("client update request returned status %s", resp.Status)
+	}
+
+	a.logger.Info("dynamically registered new redirect URI", zap.String("server", serverName), zap.String("uri", callbackURL))
+	return nil
+}
+
 // Start implementing caddy.App
 func (a *App) Start() error {
 	// Log enabled features for each server at debug level
@@ -237,58 +306,315 @@ func (a *App) Start() error {
 					req.Header.Set("Authorization", "Bearer "+config.APIToken)
 				}
 
-				// Use a custom client with a short timeout
-				client := &http.Client{
-					Timeout: 5 * time.Second,
+				var resp *http.Response
+				var client *http.Client
+
+				// Retry mechanism: 3s, 5s, 10s, 30s, 1m, 1.5m, 2m max wait
+				delays := []time.Duration{
+					3 * time.Second,
+					5 * time.Second,
+					10 * time.Second,
+					30 * time.Second,
+					1 * time.Minute,
+					90 * time.Second,
+					2 * time.Minute,
 				}
 
-				resp, err := client.Do(req)
-				if err != nil {
-					a.logger.Error("autentico health check failed", zap.Error(err), zap.String("server", name))
+				success := false
+				for i, delay := range delays {
+					// Reload system cert pool on each retry to pick up new Caddy CA
+					pool, _ := x509.SystemCertPool()
+					client = &http.Client{
+						Timeout: 5 * time.Second,
+						Transport: &http.Transport{
+							TLSClientConfig: &tls.Config{RootCAs: pool},
+						},
+					}
+
+					resp, err = client.Do(req)
+					if err == nil && resp.StatusCode == http.StatusOK {
+						success = true
+						if resp.Body != nil {
+							resp.Body.Close()
+						}
+						break
+					}
+
+					if resp != nil && resp.Body != nil {
+						resp.Body.Close()
+					}
+
+					a.logger.Warn("autentico health check failed, retrying...", zap.Error(err), zap.String("server", name), zap.Duration("next_retry", delay))
+					if i < len(delays)-1 {
+						time.Sleep(delay)
+					}
+				}
+
+				if !success {
+					a.logger.Error("autentico health check failed after max retries", zap.String("server", name))
 					return
 				}
-				defer resp.Body.Close()
 
-				if resp.StatusCode != http.StatusOK {
-					a.logger.Warn("autentico health check returned non-200 status", zap.String("status", resp.Status), zap.String("server", name))
-					return
+				// 1.5 Validate API Token and Routes if APIToken is provided
+				if config.APIToken != "" {
+					parts := strings.Split(config.APIToken, ".")
+					if len(parts) == 3 {
+						payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+						if err != nil {
+							a.logger.Error("failed to decode APIToken payload", zap.Error(err), zap.String("server", name))
+							return
+						}
+
+						var claims struct {
+							Routes []string `json:"routes"`
+						}
+						if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+							a.logger.Error("failed to unmarshal APIToken claims", zap.Error(err), zap.String("server", name))
+							return
+						}
+
+						// Map features to required routes
+						requiredRoutes := []string{}
+						for _, f := range config.Features {
+							if f == "oidc" {
+								requiredRoutes = append(requiredRoutes, "/admin/api/clients:POST", "/admin/api/clients/{id}:GET", "/admin/api/clients/{id}:PUT")
+							} else if f == "groups" {
+								requiredRoutes = append(requiredRoutes, "/admin/api/users/lookup:POST")
+							}
+						}
+
+						// Verify required routes are in the token
+						hasWildcard := false
+						for _, r := range claims.Routes {
+							if r == "*:*" || r == "/*:*" || r == "*" {
+								hasWildcard = true
+								break
+							}
+						}
+
+						if !hasWildcard && len(requiredRoutes) > 0 {
+							for _, reqRoute := range requiredRoutes {
+								reqPathMethod := strings.SplitN(reqRoute, ":", 2)
+								reqPath := reqPathMethod[0]
+								reqMethod := ""
+								if len(reqPathMethod) > 1 {
+									reqMethod = reqPathMethod[1]
+								}
+
+								found := false
+								for _, tokenRoute := range claims.Routes {
+									trParts := strings.SplitN(tokenRoute, ":", 2)
+									trPath := trParts[0]
+									trMethod := ""
+									if len(trParts) > 1 {
+										trMethod = trParts[1]
+									}
+
+									// Check if token route is a prefix of required route and methods match or wildcard
+									if strings.HasPrefix(reqPath, trPath) {
+										if trMethod == "*" || trMethod == "" || reqMethod == "" || trMethod == reqMethod {
+											found = true
+											break
+										}
+									}
+								}
+								if !found {
+									a.logger.Error("APIToken missing required route for enabled features",
+										zap.String("server", name), zap.String("required_route", reqRoute))
+									return
+								}
+							}
+						}
+
+						// Cryptographic verification by calling API
+						verifyReq, err := http.NewRequest("GET", config.URL+"/admin/api/settings", nil)
+						if err != nil {
+							a.logger.Error("failed to create APIToken verification request", zap.Error(err), zap.String("server", name))
+							return
+						}
+						verifyReq.Header.Set("Authorization", "Bearer "+config.APIToken)
+
+						verifyResp, err := client.Do(verifyReq)
+						if err != nil {
+							a.logger.Error("failed to verify APIToken against API", zap.Error(err), zap.String("server", name))
+							return
+						}
+						defer verifyResp.Body.Close()
+
+						if verifyResp.StatusCode != http.StatusOK {
+							a.logger.Error("APIToken verification failed (invalid token or unauthorized)", zap.String("status", verifyResp.Status), zap.String("server", name))
+							return
+						}
+						a.logger.Info("autentico APIToken validated successfully", zap.String("server", name))
+
+					} else {
+						a.logger.Error("invalid APIToken format (expected JWT)", zap.String("server", name))
+						return
+					}
 				}
 
 				a.logger.Info("autentico health check successful", zap.String("server", name))
 
-				// 2. Fetch CA chain for MTLS
-				caReq, err := http.NewRequest("GET", config.URL+"/ca.crt", nil)
-				if err != nil {
-					a.logger.Error("failed to create ca.crt request", zap.Error(err), zap.String("server", name))
-					return
-				}
-				caResp, err := client.Do(caReq)
-				if err != nil {
-					a.logger.Error("failed to fetch ca.crt", zap.Error(err), zap.String("server", name))
-					return
-				}
-				defer caResp.Body.Close()
+				// 3. Feature-Specific Checks
+				for _, feature := range config.Features {
+					if feature == "oidc" {
+						// Test client secret
+						clientID := config.ClientID
+						if clientID == "" {
+							clientID = "caddy.plugin.autentico"
+						}
 
-				if caResp.StatusCode == http.StatusOK {
-					caBytes, err := io.ReadAll(caResp.Body)
-					if err != nil {
-						a.logger.Error("failed to read ca.crt response", zap.Error(err), zap.String("server", name))
-						return
+						data := url.Values{}
+						data.Set("grant_type", "client_credentials")
+						data.Set("client_id", clientID)
+						if config.ClientSecret != "" {
+							data.Set("client_secret", config.ClientSecret)
+						}
+
+						tokenReq, err := http.NewRequest("POST", config.URL+"/oauth2/token", strings.NewReader(data.Encode()))
+						if err != nil {
+							a.logger.Error("failed to create token request for oidc check", zap.Error(err), zap.String("server", name))
+							return
+						}
+						tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+						tokenResp, err := client.Do(tokenReq)
+						if err != nil {
+							a.logger.Error("failed to execute token request for oidc check", zap.Error(err), zap.String("server", name))
+							return
+						}
+						defer tokenResp.Body.Close()
+
+						if tokenResp.StatusCode == http.StatusOK {
+							a.logger.Info("autentico oidc client verified", zap.String("server", name))
+
+							// Fetch client details to populate RedirectURIs
+							clientReq, _ := http.NewRequest("GET", config.URL+"/admin/api/clients/"+clientID, nil)
+							clientReq.Header.Set("Authorization", "Bearer "+config.APIToken)
+							clientResp, err := client.Do(clientReq)
+							if err == nil && clientResp.StatusCode == http.StatusOK {
+								var clientData struct {
+									RedirectURIs []string `json:"redirect_uris"`
+								}
+								if err := json.NewDecoder(clientResp.Body).Decode(&clientData); err == nil {
+									state := a.serverStates[name]
+									state.mu.Lock()
+									state.RedirectURIs = clientData.RedirectURIs
+									state.mu.Unlock()
+								}
+								clientResp.Body.Close()
+							}
+						} else if tokenResp.StatusCode == http.StatusUnauthorized || tokenResp.StatusCode == http.StatusBadRequest {
+							// Client exists but secret might be wrong, OR it doesn't exist
+							// Let's check if it exists
+							clientReq, _ := http.NewRequest("GET", config.URL+"/admin/api/clients/"+clientID, nil)
+							clientReq.Header.Set("Authorization", "Bearer "+config.APIToken)
+							clientResp, err := client.Do(clientReq)
+
+							if err == nil && clientResp.StatusCode == http.StatusOK {
+								// Client exists, but secret was wrong
+								a.logger.Error("oidc client secret is invalid", zap.String("server", name), zap.String("client_id", clientID))
+								clientResp.Body.Close()
+								return
+							}
+							if clientResp != nil && clientResp.Body != nil {
+								clientResp.Body.Close()
+							}
+
+							// Client doesn't exist, create it
+							a.logger.Info("oidc client not found, attempting to create", zap.String("server", name), zap.String("client_id", clientID))
+							createPayload := map[string]interface{}{
+								"client_id":                  clientID,
+								"client_name":                "Caddy Autentico Plugin",
+								"client_secret":              config.ClientSecret,
+								"redirect_uris":              []string{},
+								"grant_types":                []string{"authorization_code", "client_credentials"},
+								"response_types":             []string{"code"},
+								"token_endpoint_auth_method": "client_secret_post",
+							}
+							createBody, _ := json.Marshal(createPayload)
+							createReq, err := http.NewRequest("POST", config.URL+"/admin/api/clients", bytes.NewReader(createBody))
+							if err == nil {
+								createReq.Header.Set("Authorization", "Bearer "+config.APIToken)
+								createReq.Header.Set("Content-Type", "application/json")
+								createResp, err := client.Do(createReq)
+								if err == nil {
+									defer createResp.Body.Close()
+									if createResp.StatusCode == http.StatusCreated {
+										a.logger.Info("oidc client created successfully", zap.String("server", name))
+										state := a.serverStates[name]
+										state.mu.Lock()
+										state.RedirectURIs = []string{}
+										state.mu.Unlock()
+									} else {
+										a.logger.Error("failed to create oidc client", zap.String("server", name), zap.String("status", createResp.Status))
+										return
+									}
+								}
+							}
+						}
+					} else if feature == "mtls" || feature == "tls" {
+						// Fetch CA chain for MTLS/TLS
+						caReq, err := http.NewRequest("GET", config.URL+"/ca.crt", nil)
+						if err != nil {
+							a.logger.Error("failed to create ca.crt request", zap.Error(err), zap.String("server", name))
+							return
+						}
+						caResp, err := client.Do(caReq)
+						if err != nil {
+							a.logger.Error("failed to fetch ca.crt", zap.Error(err), zap.String("server", name))
+							return
+						}
+						defer caResp.Body.Close()
+
+						if caResp.StatusCode == http.StatusOK {
+							caBytes, err := io.ReadAll(caResp.Body)
+							if err != nil {
+								a.logger.Error("failed to read ca.crt response", zap.Error(err), zap.String("server", name))
+								return
+							}
+
+							// Parse and verify expiration
+							pool := x509.NewCertPool()
+							if ok := pool.AppendCertsFromPEM(caBytes); !ok {
+								a.logger.Error("failed to parse ca.crt PEM", zap.String("server", name))
+								return
+							}
+
+							// Check intermediaries for expiration
+							for len(caBytes) > 0 {
+								var block *pem.Block
+								block, caBytes = pem.Decode(caBytes)
+								if block == nil {
+									break
+								}
+								if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+									continue
+								}
+
+								cert, err := x509.ParseCertificate(block.Bytes)
+								if err != nil {
+									continue
+								}
+
+								// check if within a year of expiring
+								if cert.NotAfter.Sub(time.Now()) < 365*24*time.Hour {
+									a.logger.Warn("CA certificate within a year of expiring",
+										zap.String("server", name),
+										zap.String("subject", cert.Subject.CommonName),
+										zap.Time("expires", cert.NotAfter))
+								}
+							}
+
+							state := a.serverStates[name]
+							state.mu.Lock()
+							state.CertPool = pool
+							state.mu.Unlock()
+							a.logger.Info("autentico CA chain loaded successfully", zap.String("server", name))
+						} else {
+							a.logger.Warn("failed to fetch ca.crt, mtls might not work", zap.String("status", caResp.Status), zap.String("server", name))
+						}
 					}
-
-					pool := x509.NewCertPool()
-					if ok := pool.AppendCertsFromPEM(caBytes); !ok {
-						a.logger.Error("failed to parse ca.crt PEM", zap.String("server", name))
-						return
-					}
-
-					state := a.serverStates[name]
-					state.mu.Lock()
-					state.CertPool = pool
-					state.mu.Unlock()
-					a.logger.Info("autentico CA chain loaded successfully", zap.String("server", name))
-				} else {
-					a.logger.Warn("failed to fetch ca.crt, mtls might not work", zap.String("status", caResp.Status), zap.String("server", name))
 				}
 			}()
 		}
