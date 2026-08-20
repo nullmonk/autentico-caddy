@@ -1,9 +1,9 @@
-FROM caddy:builder-alpine AS builder
+FROM golang:alpine AS builder
 
-COPY . /src
+WORKDIR /src
+COPY . .
 
-RUN xcaddy build \
-    --with github.com/nullmonk/autentico-caddy=/src
+RUN go build -o /usr/bin/caddy cmd/main.go
 
 FROM caddy:alpine
 
