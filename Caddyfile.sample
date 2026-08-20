@@ -1,0 +1,37 @@
+# 1. Single-line shorthand (default server assumed)
+route /dashboard/* {
+    autentico allow roles editor viewer
+}
+
+# 2. Block shorthand (default server assumed)
+route /settings/* {
+    autentico {
+        allow {
+            roles admin
+        }
+    }
+}
+
+# 3. Mixing implicit default with explicit remote servers
+# Evaluates: (admin@default AND auditor@compliance_srv) OR superadmin@default
+route /audit/* {
+    autentico {
+        require_all {
+            allow roles admin                 # Assumes "default"
+            allow compliance_srv roles auditor # Explicit server
+        }
+        allow roles superadmin                # Assumes "default"
+    }
+}
+
+# 4. Complex nested policy with implicit defaults
+# Evaluates: support@default OR (billing@default AND fraud_analyst@risk_engine)
+route /billing/* {
+    autentico {
+        allow roles support
+        require_all {
+            allow roles billing
+            allow risk_engine roles fraud_analyst
+        }
+    }
+}
