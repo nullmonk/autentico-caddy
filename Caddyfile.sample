@@ -9,7 +9,7 @@
             url http://authentico:9999
             client_id my_caddy_client
             client_secret super_secret_string
-            API token my_api_token
+            api_token my_api_token
         }
 
         # Configure an additional server to demonstrate multi-server support
