@@ -17,10 +17,17 @@ func init() {
 	httpcaddyfile.RegisterGlobalOption("autentico", parseAutenticoGlobal)
 }
 
+// ServerConfig defines the configuration for an autentico server
+type ServerConfig struct {
+	URL          string `json:"url,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	APIToken     string `json:"api_token,omitempty"`
+}
+
 // App implements the global Caddy app for Autentico
 type App struct {
-	APIKey string `json:"api_key,omitempty"`
-	Host   string `json:"host,omitempty"`
+	Servers map[string]ServerConfig `json:"servers,omitempty"`
 
 	logger *zap.Logger
 }
@@ -42,38 +49,42 @@ func (a *App) Provision(ctx caddy.Context) error {
 // Start implementing caddy.App
 func (a *App) Start() error {
 	// Simple health check at caddy start up
-	if a.Host != "" {
-		// Run in a background goroutine so it doesn't block Caddy's start up
-		go func() {
-			req, err := http.NewRequest("GET", a.Host+"/healthz", nil)
-			if err != nil {
-				a.logger.Error("failed to create autentico health check request", zap.Error(err))
-				return
-			}
+	for serverName, serverConfig := range a.Servers {
+		if serverConfig.URL != "" {
+			name := serverName
+			config := serverConfig
+			// Run in a background goroutine so it doesn't block Caddy's start up
+			go func() {
+				req, err := http.NewRequest("GET", config.URL+"/healthz", nil)
+				if err != nil {
+					a.logger.Error("failed to create autentico health check request", zap.Error(err), zap.String("server", name))
+					return
+				}
 
-			if a.APIKey != "" {
-				req.Header.Set("Authorization", "Bearer "+a.APIKey)
-			}
+				if config.APIToken != "" {
+					req.Header.Set("Authorization", "Bearer "+config.APIToken)
+				}
 
-			// Use a custom client with a short timeout
-			client := &http.Client{
-				Timeout: 5 * time.Second,
-			}
+				// Use a custom client with a short timeout
+				client := &http.Client{
+					Timeout: 5 * time.Second,
+				}
 
-			resp, err := client.Do(req)
-			if err != nil {
-				a.logger.Error("autentico health check failed", zap.Error(err))
-				return
-			}
-			defer resp.Body.Close()
+				resp, err := client.Do(req)
+				if err != nil {
+					a.logger.Error("autentico health check failed", zap.Error(err), zap.String("server", name))
+					return
+				}
+				defer resp.Body.Close()
 
-			if resp.StatusCode != http.StatusOK {
-				a.logger.Warn("autentico health check returned non-200 status", zap.String("status", resp.Status))
-				return
-			}
+				if resp.StatusCode != http.StatusOK {
+					a.logger.Warn("autentico health check returned non-200 status", zap.String("status", resp.Status), zap.String("server", name))
+					return
+				}
 
-			a.logger.Info("autentico health check successful")
-		}()
+				a.logger.Info("autentico health check successful", zap.String("server", name))
+			}()
+		}
 	}
 	return nil
 }
@@ -90,22 +101,54 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 		app = existingVal.(*App)
 	}
 
+	if app.Servers == nil {
+		app.Servers = make(map[string]ServerConfig)
+	}
+
 	for d.Next() {
 		for d.NextBlock(0) {
-			switch d.Val() {
-			case "api_key":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				app.APIKey = d.Val()
-			case "host":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				app.Host = d.Val()
-			default:
-				return nil, d.Errf("unrecognized subdirective: %s", d.Val())
+			if d.Val() != "server" {
+				return nil, d.Errf("unrecognized subdirective: %s, expected 'server'", d.Val())
 			}
+
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			serverName := d.Val()
+
+			var sc ServerConfig
+			for d.NextBlock(1) {
+				switch d.Val() {
+				case "url":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					sc.URL = d.Val()
+				case "client_id":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					sc.ClientID = d.Val()
+				case "client_secret":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					sc.ClientSecret = d.Val()
+				case "api_token", "API":
+					if d.Val() == "API" {
+						if !d.NextArg() || d.Val() != "token" {
+							return nil, d.Err("expected 'token' after 'API'")
+						}
+					}
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					sc.APIToken = d.Val()
+				default:
+					return nil, d.Errf("unrecognized server option: %s", d.Val())
+				}
+			}
+			app.Servers[serverName] = sc
 		}
 	}
 
