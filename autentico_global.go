@@ -35,10 +35,11 @@ type ServerState struct {
 
 // ServerConfig defines the configuration for an autentico server
 type ServerConfig struct {
-	URL          string `json:"url,omitempty"`
-	ClientID     string `json:"client_id,omitempty"`
-	ClientSecret string `json:"client_secret,omitempty"`
-	APIToken     string `json:"api_token,omitempty"`
+	URL          string   `json:"url,omitempty"`
+	ClientID     string   `json:"client_id,omitempty"`
+	ClientSecret string   `json:"client_secret,omitempty"`
+	APIToken     string   `json:"api_token,omitempty"`
+	Features     []string `json:"features,omitempty"`
 }
 
 // TokenCacheEntry stores a cached group resolution
@@ -54,6 +55,27 @@ type App struct {
 	logger       *zap.Logger
 	serverStates map[string]*ServerState
 	tokenCache   sync.Map // Token (string) -> *TokenCacheEntry
+	mu           sync.Mutex
+}
+
+// RegisterFeature adds a feature to the server config if it doesn't already exist
+func (a *App) RegisterFeature(serverName, feature string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	config, ok := a.Servers[serverName]
+	if !ok {
+		return
+	}
+
+	for _, f := range config.Features {
+		if f == feature {
+			return
+		}
+	}
+
+	config.Features = append(config.Features, feature)
+	a.Servers[serverName] = config
 }
 
 // CaddyModule returns the Caddy module information.
@@ -188,6 +210,15 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 
 // Start implementing caddy.App
 func (a *App) Start() error {
+	// Log enabled features for each server at debug level
+	for serverName, serverConfig := range a.Servers {
+		if len(serverConfig.Features) > 0 {
+			a.logger.Debug("autentico features enabled",
+				zap.String("server", serverName),
+				zap.Strings("features", serverConfig.Features))
+		}
+	}
+
 	// Simple health check at caddy start up
 	for serverName, serverConfig := range a.Servers {
 		if serverConfig.URL != "" {
