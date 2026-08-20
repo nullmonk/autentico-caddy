@@ -1,37 +1,35 @@
-# 1. Single-line shorthand (default server assumed)
-route /dashboard/* {
-    autentico allow roles editor viewer
-}
-
-# 2. Block shorthand (default server assumed)
-route /settings/* {
+{
+    order autentico before reverse_proxy
     autentico {
-        allow {
-            roles admin
+        server default {
+            url http://authentico:9999
+            client_id my_caddy_client
+            client_secret super_secret_string
+            API token my_api_token
         }
     }
 }
 
-# 3. Mixing implicit default with explicit remote servers
-# Evaluates: (admin@default AND auditor@compliance_srv) OR superadmin@default
-route /audit/* {
-    autentico {
-        require_all {
-            allow roles admin                 # Assumes "default"
-            allow compliance_srv roles auditor # Explicit server
-        }
-        allow roles superadmin                # Assumes "default"
+example.internal {
+    route {
+        autentico allow groups admin # auto listens on domain + /oauth2/callback # sets cookie for domain
     }
+    respond "you have logged in" 200
 }
 
-# 4. Complex nested policy with implicit defaults
-# Evaluates: support@default OR (billing@default AND fraud_analyst@risk_engine)
-route /billing/* {
-    autentico {
-        allow roles support
-        require_all {
-            allow roles billing
-            allow risk_engine roles fraud_analyst
-        }
+something.example.internal {
+    route {
+        autentico allow groups admin # auto listens on domain + /oauth2/callback # sets cookie for domain example.internal
     }
+    respond "you have logged in" 200
+}
+
+other.internal {
+    route {
+        autentico {
+            allow groups user
+            callback_path "/customcallback"
+        } # auto listens on domain + /customcallback # sets cookie for domain other.internal
+    }
+    respond "you have logged in" 200
 }
