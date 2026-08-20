@@ -1,35 +1,64 @@
 {
+    # The order directive is required if using autentico outside of a route block
     order autentico before reverse_proxy
+
+    # Global autentico app configuration
     autentico {
+        # Configure the 'default' server
         server default {
             url http://authentico:9999
             client_id my_caddy_client
             client_secret super_secret_string
             API token my_api_token
         }
+
+        # Configure an additional server to demonstrate multi-server support
+        server other_server {
+            url http://authentico-other:9999
+            client_id other_client
+            client_secret other_secret
+            api_token other_token
+        }
     }
 }
 
 example.internal {
     route {
-        autentico allow groups admin # auto listens on domain + /oauth2/callback # sets cookie for domain
+        # Inline configuration: allows users in the 'admin' group.
+        # Uses the 'default' server configuration since server_name is not specified.
+        # auto listens on domain + /oauth2/callback
+        # sets cookie for domain example.internal
+        autentico allow groups admin
     }
     respond "you have logged in" 200
 }
 
 something.example.internal {
     route {
-        autentico allow groups admin # auto listens on domain + /oauth2/callback # sets cookie for domain example.internal
+        # Inline configuration allowing multiple groups
+        # auto listens on domain + /oauth2/callback
+        # sets cookie for domain something.example.internal
+        autentico allow groups admin manager
     }
     respond "you have logged in" 200
 }
 
 other.internal {
     route {
+        # Block configuration for autentico
         autentico {
-            allow groups user
+            # Specifies which server configuration to use from the global block
+            # Defaults to 'default' if not specified
+            server_name other_server
+
+            # The groups allowed to access the route
+            allow groups user admin
+
+            # Custom callback path (defaults to /oauth2/callback)
+            # auto listens on domain + /customcallback
+            # sets cookie for domain other.internal
             callback_path "/customcallback"
-        } # auto listens on domain + /customcallback # sets cookie for domain other.internal
+        }
     }
     respond "you have logged in" 200
 }
