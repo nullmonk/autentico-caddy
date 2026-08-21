@@ -523,11 +523,16 @@ func (a *App) Start() error {
 
 							// Client doesn't exist, create it
 							a.logger.Info("oidc client not found, attempting to create", zap.String("server", name), zap.String("client_id", clientID))
+							// ACO rejects a blank redirect_uris list on creation. The real
+							// callback URL isn't known until a request arrives (it's derived
+							// from the request Host), so seed a placeholder here and let
+							// RegisterRedirectURI append the real one dynamically.
+							placeholderRedirectURI := "http://localhost/oauth2/callback"
 							createPayload := map[string]interface{}{
 								"client_id":                  clientID,
 								"client_name":                "Caddy Autentico Plugin",
 								"client_secret":              config.ClientSecret,
-								"redirect_uris":              []string{},
+								"redirect_uris":              []string{placeholderRedirectURI},
 								"grant_types":                []string{"authorization_code", "client_credentials"},
 								"response_types":             []string{"code"},
 								"token_endpoint_auth_method": "client_secret_post",
@@ -544,10 +549,11 @@ func (a *App) Start() error {
 										a.logger.Info("oidc client created successfully", zap.String("server", name))
 										state := a.serverStates[name]
 										state.mu.Lock()
-										state.RedirectURIs = []string{}
+										state.RedirectURIs = []string{placeholderRedirectURI}
 										state.mu.Unlock()
 									} else {
-										a.logger.Error("failed to create oidc client", zap.String("server", name), zap.String("status", createResp.Status))
+										body, _ := io.ReadAll(createResp.Body)
+										a.logger.Error("failed to create oidc client", zap.String("server", name), zap.String("status", createResp.Status), zap.ByteString("response", body))
 										return
 									}
 								}
