@@ -14,6 +14,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/coreos/go-oidc/v3/oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -263,7 +264,14 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				AccessToken: token,
 				TokenType:   "Bearer",
 			}
-			userInfo, err := state.Provider.UserInfo(r.Context(), oauth2.StaticTokenSource(oauth2Token))
+
+			// Inject the custom HTTPClient into context for OIDC requests
+			ctx := r.Context()
+			if state.HTTPClient != nil {
+				ctx = context.WithValue(ctx, oauth2.HTTPClient, state.HTTPClient)
+			}
+
+			userInfo, err := state.Provider.UserInfo(ctx, oauth2.StaticTokenSource(oauth2Token))
 			if err != nil {
 				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
 				// Token might be invalid/expired, clear cookie if it came from one
@@ -363,6 +371,10 @@ func (a *Autentico) handleCallback(w http.ResponseWriter, r *http.Request, state
 		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("invalid oauth state"))
 	}
 
+	if state.HTTPClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, state.HTTPClient)
+	}
+
 	oauth2Token, err := oauthConfig.Exchange(ctx, r.URL.Query().Get("code"))
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("failed to exchange token: %v", err))
@@ -374,6 +386,10 @@ func (a *Autentico) handleCallback(w http.ResponseWriter, r *http.Request, state
 	}
 
 	// Verify ID Token to make sure it's valid
+	// Note: We need to use oidc.ClientContext for go-oidc to pick it up in Verify (which fetches JWKS if needed)
+	if state.HTTPClient != nil {
+		ctx = oidc.ClientContext(ctx, state.HTTPClient)
+	}
 	_, err = state.Verifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("failed to verify ID token: %v", err))
