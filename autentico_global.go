@@ -19,7 +19,6 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddypki"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
@@ -32,23 +31,24 @@ func init() {
 
 // ServerState holds runtime state for an autentico server
 type ServerState struct {
-	Provider       *oidc.Provider
-	Config         oauth2.Config
-	Verifier       *oidc.IDTokenVerifier
-	CertPool       *x509.CertPool
-	CertsInstalled bool
-	mu             sync.Mutex
+	Provider *oidc.Provider
+	Config   oauth2.Config
+	Verifier *oidc.IDTokenVerifier
+	CertPool *x509.CertPool
+	mu       sync.Mutex
+	Client   *http.Client
 
 	RedirectURIs []string
 }
 
 // ServerConfig defines the configuration for an autentico server
 type ServerConfig struct {
-	URL          string   `json:"url,omitempty"`
-	ClientID     string   `json:"client_id,omitempty"`
-	ClientSecret string   `json:"client_secret,omitempty"`
-	APIToken     string   `json:"api_token,omitempty"`
-	Features     []string `json:"features,omitempty"`
+	URL           string   `json:"url,omitempty"`
+	ClientID      string   `json:"client_id,omitempty"`
+	ClientSecret  string   `json:"client_secret,omitempty"`
+	APIToken      string   `json:"api_token,omitempty"`
+	Features      []string `json:"features,omitempty"`
+	InsecureHTTPS bool     `json:"insecure_https,omitempty"`
 }
 
 // TokenCacheEntry stores a cached group resolution
@@ -61,7 +61,6 @@ type TokenCacheEntry struct {
 type App struct {
 	Servers map[string]ServerConfig `json:"servers,omitempty"`
 
-	ctx          caddy.Context
 	logger       *zap.Logger
 	serverStates map[string]*ServerState
 	tokenCache   sync.Map // Token (string) -> *TokenCacheEntry
@@ -98,11 +97,22 @@ func (App) CaddyModule() caddy.ModuleInfo {
 
 // Provision implements caddy.Provisioner
 func (a *App) Provision(ctx caddy.Context) error {
-	a.ctx = ctx
 	a.logger = ctx.Logger()
 	a.serverStates = make(map[string]*ServerState)
-	for name := range a.Servers {
-		a.serverStates[name] = &ServerState{}
+	for name, config := range a.Servers {
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+		}
+
+		if config.InsecureHTTPS {
+			client.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+		}
+
+		a.serverStates[name] = &ServerState{
+			Client: client,
+		}
 	}
 	return nil
 }
@@ -131,13 +141,16 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 	// discovery document (e.g. `http://autentico` vs `http://localhost`), we must
 	// fetch the expected issuer ourselves first to inform go-oidc of what to accept.
 	wellKnown := strings.TrimSuffix(config.URL, "/") + "/.well-known/openid-configuration"
-	req, err := http.NewRequestWithContext(ctx, "GET", wellKnown, nil)
+
+	reqCtx := context.WithValue(ctx, oauth2.HTTPClient, state.Client)
+	reqCtx = oidc.ClientContext(reqCtx, state.Client)
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", wellKnown, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create discovery request: %w", err)
 	}
 
-	client := http.DefaultClient
-	resp, err := client.Do(req)
+	resp, err := state.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch discovery document: %w", err)
 	}
@@ -154,7 +167,7 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		return nil, fmt.Errorf("failed to decode discovery document: %w", err)
 	}
 
-	providerCtx := oidc.InsecureIssuerURLContext(ctx, p.Issuer)
+	providerCtx := oidc.InsecureIssuerURLContext(reqCtx, p.Issuer)
 	provider, err := oidc.NewProvider(providerCtx, config.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize OIDC provider: %w", err)
@@ -203,6 +216,10 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 	if !ok {
 		return nil, fmt.Errorf("server configuration %q not found", serverName)
 	}
+	state, ok := a.serverStates[serverName]
+	if !ok {
+		return nil, fmt.Errorf("server state %q not found", serverName)
+	}
 	if config.APIToken == "" {
 		return nil, fmt.Errorf("APIToken is required for MTLS group resolution")
 	}
@@ -222,8 +239,7 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 	req.Header.Set("Authorization", "Bearer "+config.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := state.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("lookup request failed: %v", err)
 	}
@@ -309,8 +325,7 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 	req.Header.Set("Authorization", "Bearer "+config.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := state.Client.Do(req)
 	if err != nil {
 		return fmt.Errorf("client update request failed: %v", err)
 	}
@@ -403,7 +418,7 @@ func (a *App) Start() error {
 			// Run in a background goroutine so it doesn't block Caddy's start up
 			go func() {
 				// 1. Health check
-				req, err := http.NewRequest("GET", config.URL+"/ca.crt", nil)
+				req, err := http.NewRequest("GET", config.URL+"/healthz", nil)
 				if err != nil {
 					a.logger.Error("failed to create autentico health check request", zap.Error(err), zap.String("server", name))
 					return
@@ -431,75 +446,22 @@ func (a *App) Start() error {
 				for i, delay := range delays {
 					// Reload system cert pool on each retry to pick up new Caddy CA
 					pool, _ := x509.SystemCertPool()
-					if pool == nil {
-						pool = x509.NewCertPool()
-					}
 
-					// Get Caddy's internal PKI certificates
-					pkiAppIface, err := a.ctx.App("pki")
-					if err == nil && pkiAppIface != nil {
-						pkiApp := pkiAppIface.(*caddypki.PKI)
-						for _, ca := range pkiApp.CAs {
-							if ca.RootCertificate() != nil {
-								pool.AddCert(ca.RootCertificate())
-							}
-						}
+					tlsConfig := &tls.Config{RootCAs: pool}
+					if config.InsecureHTTPS {
+						tlsConfig.InsecureSkipVerify = true
 					}
 
 					client = &http.Client{
 						Timeout: 5 * time.Second,
 						Transport: &http.Transport{
-							TLSClientConfig: &tls.Config{RootCAs: pool},
+							TLSClientConfig: tlsConfig,
 						},
 					}
 
 					resp, err = client.Do(req)
-					if err == nil && resp.StatusCode < 500 {
+					if err == nil && resp.StatusCode == http.StatusOK {
 						success = true
-
-						if resp.StatusCode == http.StatusOK && resp.Body != nil {
-							caBytes, readErr := io.ReadAll(resp.Body)
-							if readErr == nil {
-								state := a.serverStates[name]
-								state.mu.Lock()
-								if state.CertPool == nil {
-									state.CertPool = x509.NewCertPool()
-								}
-								if ok := state.CertPool.AppendCertsFromPEM(caBytes); ok {
-									state.CertsInstalled = true
-
-									// Check intermediaries for expiration
-									caBytesCopy := caBytes
-									for len(caBytesCopy) > 0 {
-										var block *pem.Block
-										block, caBytesCopy = pem.Decode(caBytesCopy)
-										if block == nil {
-											break
-										}
-										if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-											continue
-										}
-
-										cert, err := x509.ParseCertificate(block.Bytes)
-										if err != nil {
-											continue
-										}
-
-										// check if within a year of expiring
-										if cert.NotAfter.Sub(time.Now()) < 365*24*time.Hour {
-											a.logger.Warn("CA certificate within a year of expiring",
-												zap.String("server", name),
-												zap.String("subject", cert.Subject.CommonName),
-												zap.Time("expires", cert.NotAfter))
-										}
-									}
-								} else {
-									a.logger.Warn("failed to parse ca.crt PEM during health check", zap.String("server", name))
-								}
-								state.mu.Unlock()
-							}
-						}
-
 						if resp.Body != nil {
 							resp.Body.Close()
 						}
@@ -737,15 +699,65 @@ func (a *App) Start() error {
 							}
 						}
 					} else if feature == "mtls" || feature == "tls" {
-						state := a.serverStates[name]
-						state.mu.Lock()
-						certsInstalled := state.CertsInstalled
-						state.mu.Unlock()
+						// Fetch CA chain for MTLS/TLS
+						caReq, err := http.NewRequest("GET", config.URL+"/ca.crt", nil)
+						if err != nil {
+							a.logger.Error("failed to create ca.crt request", zap.Error(err), zap.String("server", name))
+							return
+						}
+						caResp, err := client.Do(caReq)
+						if err != nil {
+							a.logger.Error("failed to fetch ca.crt", zap.Error(err), zap.String("server", name))
+							return
+						}
+						defer caResp.Body.Close()
 
-						if certsInstalled {
-							a.logger.Info("autentico CA chain loaded successfully for mtls/tls", zap.String("server", name))
+						if caResp.StatusCode == http.StatusOK {
+							caBytes, err := io.ReadAll(caResp.Body)
+							if err != nil {
+								a.logger.Error("failed to read ca.crt response", zap.Error(err), zap.String("server", name))
+								return
+							}
+
+							// Parse and verify expiration
+							pool := x509.NewCertPool()
+							if ok := pool.AppendCertsFromPEM(caBytes); !ok {
+								a.logger.Error("failed to parse ca.crt PEM", zap.String("server", name))
+								return
+							}
+
+							// Check intermediaries for expiration
+							for len(caBytes) > 0 {
+								var block *pem.Block
+								block, caBytes = pem.Decode(caBytes)
+								if block == nil {
+									break
+								}
+								if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+									continue
+								}
+
+								cert, err := x509.ParseCertificate(block.Bytes)
+								if err != nil {
+									continue
+								}
+
+								// check if within a year of expiring
+								if cert.NotAfter.Sub(time.Now()) < 365*24*time.Hour {
+									a.logger.Warn("CA certificate within a year of expiring",
+										zap.String("server", name),
+										zap.String("subject", cert.Subject.CommonName),
+										zap.Time("expires", cert.NotAfter))
+								}
+							}
+
+							state := a.serverStates[name]
+							state.mu.Lock()
+							state.CertPool = pool
+							state.mu.Unlock()
+							a.logger.Info("autentico CA chain loaded successfully", zap.String("server", name))
 						} else {
-							a.logger.Warn("CA certificates are missing, mtls might not work", zap.String("server", name))
+							a.logger.Warn("failed to fetch ca.crt, mtls might not work", zap.String("status", caResp.Status), zap.String("server", name))
 						}
 					}
 				}
@@ -810,6 +822,8 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 						return nil, d.ArgErr()
 					}
 					sc.APIToken = d.Val()
+				case "insecure_https":
+					sc.InsecureHTTPS = true
 				default:
 					return nil, d.Errf("unrecognized server option: %s", d.Val())
 				}
