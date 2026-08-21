@@ -36,17 +36,19 @@ type ServerState struct {
 	Verifier *oidc.IDTokenVerifier
 	CertPool *x509.CertPool
 	mu       sync.Mutex
+	Client   *http.Client
 
 	RedirectURIs []string
 }
 
 // ServerConfig defines the configuration for an autentico server
 type ServerConfig struct {
-	URL          string   `json:"url,omitempty"`
-	ClientID     string   `json:"client_id,omitempty"`
-	ClientSecret string   `json:"client_secret,omitempty"`
-	APIToken     string   `json:"api_token,omitempty"`
-	Features     []string `json:"features,omitempty"`
+	URL           string   `json:"url,omitempty"`
+	ClientID      string   `json:"client_id,omitempty"`
+	ClientSecret  string   `json:"client_secret,omitempty"`
+	APIToken      string   `json:"api_token,omitempty"`
+	Features      []string `json:"features,omitempty"`
+	InsecureHTTPS bool     `json:"insecure_https,omitempty"`
 }
 
 // TokenCacheEntry stores a cached group resolution
@@ -97,8 +99,20 @@ func (App) CaddyModule() caddy.ModuleInfo {
 func (a *App) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
 	a.serverStates = make(map[string]*ServerState)
-	for name := range a.Servers {
-		a.serverStates[name] = &ServerState{}
+	for name, config := range a.Servers {
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+		}
+
+		if config.InsecureHTTPS {
+			client.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+		}
+
+		a.serverStates[name] = &ServerState{
+			Client: client,
+		}
 	}
 	return nil
 }
@@ -127,13 +141,16 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 	// discovery document (e.g. `http://autentico` vs `http://localhost`), we must
 	// fetch the expected issuer ourselves first to inform go-oidc of what to accept.
 	wellKnown := strings.TrimSuffix(config.URL, "/") + "/.well-known/openid-configuration"
-	req, err := http.NewRequestWithContext(ctx, "GET", wellKnown, nil)
+
+	reqCtx := context.WithValue(ctx, oauth2.HTTPClient, state.Client)
+	reqCtx = oidc.ClientContext(reqCtx, state.Client)
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", wellKnown, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create discovery request: %w", err)
 	}
 
-	client := http.DefaultClient
-	resp, err := client.Do(req)
+	resp, err := state.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch discovery document: %w", err)
 	}
@@ -150,7 +167,7 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		return nil, fmt.Errorf("failed to decode discovery document: %w", err)
 	}
 
-	providerCtx := oidc.InsecureIssuerURLContext(ctx, p.Issuer)
+	providerCtx := oidc.InsecureIssuerURLContext(reqCtx, p.Issuer)
 	provider, err := oidc.NewProvider(providerCtx, config.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize OIDC provider: %w", err)
@@ -194,6 +211,10 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 	if !ok {
 		return nil, fmt.Errorf("server configuration %q not found", serverName)
 	}
+	state, ok := a.serverStates[serverName]
+	if !ok {
+		return nil, fmt.Errorf("server state %q not found", serverName)
+	}
 	if config.APIToken == "" {
 		return nil, fmt.Errorf("APIToken is required for MTLS group resolution")
 	}
@@ -213,8 +234,7 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 	req.Header.Set("Authorization", "Bearer "+config.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := state.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("lookup request failed: %v", err)
 	}
@@ -291,8 +311,7 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 	req.Header.Set("Authorization", "Bearer "+config.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := state.Client.Do(req)
 	if err != nil {
 		return fmt.Errorf("client update request failed: %v", err)
 	}
@@ -353,10 +372,16 @@ func (a *App) Start() error {
 				for i, delay := range delays {
 					// Reload system cert pool on each retry to pick up new Caddy CA
 					pool, _ := x509.SystemCertPool()
+
+					tlsConfig := &tls.Config{RootCAs: pool}
+					if config.InsecureHTTPS {
+						tlsConfig.InsecureSkipVerify = true
+					}
+
 					client = &http.Client{
 						Timeout: 5 * time.Second,
 						Transport: &http.Transport{
-							TLSClientConfig: &tls.Config{RootCAs: pool},
+							TLSClientConfig: tlsConfig,
 						},
 					}
 
@@ -712,6 +737,8 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 						return nil, d.ArgErr()
 					}
 					sc.APIToken = d.Val()
+				case "insecure_https":
+					sc.InsecureHTTPS = true
 				default:
 					return nil, d.Errf("unrecognized server option: %s", d.Val())
 				}

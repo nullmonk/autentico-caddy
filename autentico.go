@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
@@ -104,6 +105,10 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		a.logger.Error("failed to get server state", zap.Error(err))
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
+
+	reqCtx := context.WithValue(r.Context(), oauth2.HTTPClient, state.Client)
+	reqCtx = oidc.ClientContext(reqCtx, state.Client)
+	r = r.WithContext(reqCtx)
 
 	// Clone the config and set the dynamic RedirectURL
 	oauthConfig := state.Config
@@ -346,7 +351,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 }
 
 func (a *Autentico) handleCallback(w http.ResponseWriter, r *http.Request, state *ServerState, oauthConfig oauth2.Config) error {
-	ctx := context.Background()
+	ctx := r.Context() // Use request context which already has the injected Client
 
 	cookieState, err := r.Cookie("autentico_oauth_state")
 	if err != nil {
