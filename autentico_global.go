@@ -635,7 +635,7 @@ func (a *App) Start() error {
 							a.logger.Error("APIToken verification failed (invalid token or unauthorized)", zap.String("status", verifyResp.Status), zap.String("server", name))
 							return
 						}
-						a.logger.Info("autentico APIToken validated successfully", zap.String("server", name))
+						a.logger.Debug("autentico APIToken validated successfully", zap.String("server", name))
 
 					} else {
 						a.logger.Error("invalid APIToken format (expected JWT)", zap.String("server", name))
@@ -643,7 +643,7 @@ func (a *App) Start() error {
 					}
 				}
 
-				a.logger.Info("autentico health check successful", zap.String("server", name))
+				a.logger.Debug("autentico health check successful", zap.String("server", name))
 
 				// 3. Feature-Specific Checks
 				for _, feature := range config.Features {
@@ -676,7 +676,7 @@ func (a *App) Start() error {
 						defer tokenResp.Body.Close()
 
 						if tokenResp.StatusCode == http.StatusOK {
-							a.logger.Info("autentico oidc client verified", zap.String("server", name))
+							a.logger.Debug("autentico oidc client verified", zap.String("server", name))
 
 							// Fetch client details to populate RedirectURIs
 							clientReq, _ := http.NewRequest("GET", config.URL+"/admin/api/clients/"+clientID, nil)
@@ -767,12 +767,14 @@ func (a *App) Start() error {
 						state.mu.Unlock()
 
 						if certsInstalled {
-							a.logger.Info("autentico CA chain loaded successfully for mtls/tls", zap.String("server", name))
+							a.logger.Debug("autentico CA chain loaded successfully for mtls/tls", zap.String("server", name))
 						} else {
 							a.logger.Warn("CA certificates are missing, mtls might not work", zap.String("server", name))
 						}
 					}
 				}
+
+				a.logger.Info(fmt.Sprintf("autentico connected to %s. features active: [%s]", name, strings.Join(config.Features, " ")), zap.String("server", name), zap.Strings("features", config.Features))
 			}()
 		}
 	}
