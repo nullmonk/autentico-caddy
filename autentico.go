@@ -25,13 +25,27 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("autentico", parseCaddyfile)
 }
 
+// Rule defines a single allow or deny rule.
+type Rule struct {
+	Action string   `json:"action,omitempty"` // "allow" or "deny"
+	Type   string   `json:"type,omitempty"`   // "group", "groups", "user", "users", "method", "" (empty allow)
+	Values []string `json:"values,omitempty"` // e.g. ["admin", "dev"], or ["mtls"]
+}
+
+// Policy defines a list of rules that can optionally be evaluated with logical AND.
+type Policy struct {
+	Rules      []Rule `json:"rules,omitempty"`
+	RequireAll bool   `json:"require_all,omitempty"`
+}
+
 // Autentico implements an HTTP handler that validates requests with an Autentico service.
 type Autentico struct {
-	ServerName    string   `json:"server_name,omitempty"`
-	AllowedGroups []string `json:"allowed_groups,omitempty"`
-	CallbackPath  string   `json:"callback_path,omitempty"`
-	MTLS          string   `json:"mtls,omitempty"` // optional, require, both
-	CookieDomain  string   `json:"cookie_domain,omitempty"`
+	ServerName         string   `json:"server_name,omitempty"`
+	Policies           []Policy `json:"policies,omitempty"`
+	CallbackPath       string   `json:"callback_path,omitempty"`
+	CookieDomain       string   `json:"cookie_domain,omitempty"`
+	ErrorRespondBody   string   `json:"error_respond_body,omitempty"`
+	ErrorRespondStatus int      `json:"error_respond_status,omitempty"`
 
 	app    *App
 	logger *zap.Logger
@@ -47,30 +61,54 @@ func (Autentico) CaddyModule() caddy.ModuleInfo {
 
 // Provision implements caddy.Provisioner.
 func (a *Autentico) Provision(ctx caddy.Context) error {
-	if a.ServerName == "" {
-		a.ServerName = "default"
+	if a.ServerName == "default" {
+		a.ServerName = "" // "" is the default server alias
 	}
+
 	if a.CallbackPath == "" {
 		a.CallbackPath = "/oauth2/callback"
 	}
+
+	appIface, err := ctx.App("autentico")
+	if err != nil {
+		return fmt.Errorf("autentico app not configured: %v", err)
+	}
+	a.app = appIface.(*App)
 	a.logger = ctx.Logger()
 
-	app, err := ctx.App("autentico")
-	if err != nil {
-		return fmt.Errorf("getting autentico app: %v", err)
-	}
-	a.app = app.(*App)
-
-	if a.MTLS == "require" || a.MTLS == "optional" || a.MTLS == "both" {
-		a.app.RegisterFeature(a.ServerName, "mtls")
+	// Ensure the server exists in global config
+	if _, ok := a.app.Servers[a.ServerName]; !ok {
+		if a.ServerName == "" {
+			return fmt.Errorf("autentico default server not found in global config")
+		}
+		return fmt.Errorf("autentico server %q not found in global config", a.ServerName)
 	}
 
-	if len(a.AllowedGroups) > 0 {
+	// Register necessary features based on this handler's requirements
+	a.app.RegisterFeature(a.ServerName, "oidc")
+
+	hasGroups := false
+	hasMTLS := false
+	for _, p := range a.Policies {
+		for _, r := range p.Rules {
+			if r.Type == "group" || r.Type == "groups" {
+				hasGroups = true
+			}
+			if r.Type == "method" {
+				for _, v := range r.Values {
+					if v == "mtls" || v == "both" {
+						hasMTLS = true
+					}
+				}
+			}
+		}
+	}
+
+	if hasGroups {
 		a.app.RegisterFeature(a.ServerName, "groups")
 	}
-
-	if a.MTLS == "" || a.MTLS == "none" || a.MTLS == "optional" || a.MTLS == "both" {
-		a.app.RegisterFeature(a.ServerName, "oidc")
+	if hasMTLS {
+		a.app.RegisterFeature(a.ServerName, "mtls")
 	}
 
 	return nil
@@ -181,51 +219,28 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	tokenValid := token != ""
 
-	// Determine authentication state based on mode
-	mtlsReq := a.MTLS
-	if mtlsReq == "" {
-		mtlsReq = "none" // default to disabled
-	}
-
-	// If MTLS is required and invalid, fail early
-	if (mtlsReq == "require" || mtlsReq == "both") && !mtlsValid {
-		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("mtls required"))
-	}
-
-	// If MTLS mode is "require", we don't need token valid
-	// If "both", we need both
-	// If "optional", we need at least one
 	var authMethod string
 	var groups []string
 	var username string
 	var subject string
 
-	if mtlsReq == "require" {
+	if tokenValid && mtlsValid {
+		authMethod = "both"
+	} else if tokenValid {
+		authMethod = "token"
+	} else if mtlsValid {
 		authMethod = "mtls"
-	} else if mtlsReq == "both" {
-		if !tokenValid {
-			// Start OAuth flow for missing token
-			authMethod = "missing_token"
-		} else {
-			authMethod = "both" // We will fetch groups using the token later.
-		}
-	} else if mtlsReq == "optional" {
-		if tokenValid {
-			authMethod = "token"
-		} else if mtlsValid {
-			authMethod = "mtls"
-		} else {
-			authMethod = "missing_token"
-		}
-	} else { // mtlsReq == "none"
-		if tokenValid {
-			authMethod = "token"
-		} else {
-			authMethod = "missing_token"
-		}
+	} else {
+		authMethod = "missing_token"
 	}
 
 	if authMethod == "missing_token" {
+		if a.ErrorRespondBody != "" {
+			w.WriteHeader(a.ErrorRespondStatus)
+			w.Write([]byte(a.ErrorRespondBody))
+			return nil
+		}
+
 		if !strings.Contains(r.Header.Get("Accept"), "text/html") {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="autentico"`)
 			return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("unauthorized"))
@@ -387,22 +402,85 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 	}
 
-	// 3. Check if user's groups match allowed groups
-	if len(a.AllowedGroups) > 0 {
+	// 3. Evaluate Policies
+	// If no policies exist, we should probably allow since it's just authentication.
+	// But let's check policies. First-match-wins logic. Default is deny if they fall through.
+	if len(a.Policies) > 0 {
 		allowed := false
-		for _, userGroup := range groups {
-			for _, allowedGroup := range a.AllowedGroups {
-				if userGroup == allowedGroup {
-					allowed = true
-					break
+		matched := false
+
+		for _, policy := range a.Policies {
+			policyMatch := true
+
+			for _, rule := range policy.Rules {
+				ruleMatch := false
+
+				if rule.Type == "" { // empty allow/deny matches everything
+					ruleMatch = true
+				} else if rule.Type == "group" || rule.Type == "groups" {
+					for _, userGroup := range groups {
+						for _, val := range rule.Values {
+							if userGroup == val {
+								ruleMatch = true
+								break
+							}
+						}
+						if ruleMatch {
+							break
+						}
+					}
+				} else if rule.Type == "user" || rule.Type == "users" {
+					for _, val := range rule.Values {
+						if username == val || subject == val {
+							ruleMatch = true
+							break
+						}
+					}
+				} else if rule.Type == "method" {
+					for _, val := range rule.Values {
+						if authMethod == val || (authMethod == "both" && (val == "mtls" || val == "token")) {
+							ruleMatch = true
+							break
+						}
+					}
+				}
+
+				if policy.RequireAll {
+					// "evaluates to true if all the allows and none of the denies match"
+					if rule.Action == "allow" && !ruleMatch {
+						policyMatch = false
+						break
+					} else if rule.Action == "deny" && ruleMatch {
+						policyMatch = false
+						break
+					}
+				} else {
+					// standard rule policy block has exactly 1 rule
+					if ruleMatch {
+						matched = true
+						allowed = (rule.Action == "allow")
+						break
+					}
 				}
 			}
-			if allowed {
+
+			if matched {
+				break
+			}
+
+			if policy.RequireAll && policyMatch {
+				matched = true
+				allowed = true // require_all implies allow if all pass
 				break
 			}
 		}
 
 		if !allowed {
+			if a.ErrorRespondBody != "" {
+				w.WriteHeader(a.ErrorRespondStatus)
+				w.Write([]byte(a.ErrorRespondBody))
+				return nil
+			}
 			return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("forbidden"))
 		}
 	}
@@ -511,56 +589,132 @@ func (a *Autentico) handleCallback(w http.ResponseWriter, r *http.Request, state
 	return nil
 }
 
+func parseRuleFromArgs(action string, args []string) (Rule, error) {
+	rule := Rule{Action: action}
+	if len(args) == 0 {
+		return rule, nil
+	}
+
+	rule.Type = args[0]
+	if rule.Type != "group" && rule.Type != "groups" && rule.Type != "user" && rule.Type != "users" && rule.Type != "method" {
+		return rule, fmt.Errorf("invalid rule type '%s', expected group(s), user(s), or method", rule.Type)
+	}
+
+	rule.Values = args[1:]
+	if len(rule.Values) == 0 {
+		return rule, fmt.Errorf("expected values after '%s'", rule.Type)
+	}
+
+	if rule.Type == "method" {
+		for _, v := range rule.Values {
+			if v != "mtls" && v != "token" && v != "both" {
+				return rule, fmt.Errorf("invalid method '%s', expected mtls, token, or both", v)
+			}
+		}
+	}
+
+	return rule, nil
+}
+
+func parseRule(d *caddyfile.Dispenser, action string) (Rule, error) {
+	var args []string
+	if d.NextArg() {
+		args = append(args, d.Val())
+		args = append(args, d.RemainingArgs()...)
+	}
+	rule, err := parseRuleFromArgs(action, args)
+	if err != nil {
+		return rule, d.Err(err.Error())
+	}
+	return rule, nil
+}
+
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
-		// allow inline arguments like "allow groups admin"
-		args := d.RemainingArgs()
+		var args []string
+		if d.NextArg() {
+			args = append(args, d.Val())
+			args = append(args, d.RemainingArgs()...)
+		}
+
 		if len(args) > 0 {
-			if args[0] == "allow" {
-				if len(args) > 1 && args[1] == "groups" {
-					a.AllowedGroups = append(a.AllowedGroups, args[2:]...)
-				} else {
-					return d.Err("expected 'groups' after 'allow'")
+			// First argument could be server_name, allow, deny, etc.
+			firstArg := args[0]
+			if firstArg != "allow" && firstArg != "deny" && firstArg != "require_all" && firstArg != "callback_path" && firstArg != "cookie_domain" && firstArg != "error_respond" {
+				a.ServerName = firstArg
+				args = args[1:]
+			}
+		}
+
+		if len(args) > 0 {
+			action := args[0]
+			if action == "allow" || action == "deny" {
+				rule, err := parseRuleFromArgs(action, args[1:])
+				if err != nil {
+					return d.Errf("inline rule error: %v", err)
 				}
+				a.Policies = append(a.Policies, Policy{Rules: []Rule{rule}})
 			} else {
-				return d.Errf("unrecognized inline argument: %s", args[0])
+				return d.Errf("unrecognized inline argument: %s", action)
 			}
 		}
 
 		for d.NextBlock(0) {
-			switch d.Val() {
-			case "allow":
-				if !d.NextArg() || d.Val() != "groups" {
-					return d.Err("expected 'groups' after 'allow'")
+			val := d.Val()
+			switch val {
+			case "allow", "deny":
+				rule, err := parseRule(d, val)
+				if err != nil {
+					return err
 				}
-				a.AllowedGroups = append(a.AllowedGroups, d.RemainingArgs()...)
+				a.Policies = append(a.Policies, Policy{Rules: []Rule{rule}})
+
+			case "require_all":
+				policy := Policy{RequireAll: true}
+				for d.NextBlock(1) {
+					innerVal := d.Val()
+					if innerVal != "allow" && innerVal != "deny" {
+						return d.Errf("expected 'allow' or 'deny' inside require_all, got '%s'", innerVal)
+					}
+					rule, err := parseRule(d, innerVal)
+					if err != nil {
+						return err
+					}
+					policy.Rules = append(policy.Rules, rule)
+				}
+				a.Policies = append(a.Policies, policy)
+
 			case "callback_path":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				a.CallbackPath = d.Val()
-			case "server_name":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				a.ServerName = d.Val()
-			case "mtls":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				val := d.Val()
-				if val != "optional" && val != "require" && val != "both" {
-					return d.Errf("invalid mtls mode: %s", val)
-				}
-				a.MTLS = val
+
 			case "cookie_domain":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				a.CookieDomain = d.Val()
+
+			case "error_respond":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				a.ErrorRespondBody = d.Val()
+				if d.NextArg() {
+					var status int
+					fmt.Sscanf(d.Val(), "%d", &status)
+					if status < 100 || status > 599 {
+						return d.Errf("invalid HTTP status code '%s'", d.Val())
+					}
+					a.ErrorRespondStatus = status
+				} else {
+					a.ErrorRespondStatus = 403 // Default to 403 Forbidden
+				}
+
 			default:
-				return d.Errf("unrecognized subdirective: %s", d.Val())
+				return d.Errf("unrecognized subdirective: %s", val)
 			}
 		}
 	}
@@ -578,6 +732,6 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 var (
 	_ caddy.Provisioner           = (*Autentico)(nil)
 	_ caddy.Validator             = (*Autentico)(nil)
-	_ caddyhttp.MiddlewareHandler = (*Autentico)(nil)
+	_ caddyhttp.MiddlewareHandler = (Autentico{}) // ServeHTTP receives value, not pointer
 	_ caddyfile.Unmarshaler       = (*Autentico)(nil)
 )
