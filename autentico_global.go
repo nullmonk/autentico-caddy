@@ -67,7 +67,7 @@ type TokenCacheEntry struct {
 
 // App implements the global Caddy app for Autentico
 type App struct {
-	Servers map[string]ServerConfig `json:"servers,omitempty"`
+	Servers map[string]*ServerConfig `json:"servers,omitempty"`
 
 	ctx          caddy.Context
 	logger       *zap.Logger
@@ -93,7 +93,6 @@ func (a *App) RegisterFeature(serverName, feature string) {
 	}
 
 	config.Features = append(config.Features, feature)
-	a.Servers[serverName] = config
 }
 
 // CaddyModule returns the Caddy module information.
@@ -379,7 +378,7 @@ var requiredOIDCScopes = []string{"openid", "profile", "groups"}
 // ensureClientScopes checks the OIDC client's currently registered scopes against
 // requiredOIDCScopes and PUTs an update to add any that are missing, preserving
 // whatever scopes were already there.
-func ensureClientScopes(client *http.Client, config ServerConfig, clientID, currentScopes string, logger *zap.Logger, serverName string) {
+func ensureClientScopes(client *http.Client, config *ServerConfig, clientID, currentScopes string, logger *zap.Logger, serverName string) {
 	have := strings.Fields(currentScopes)
 	haveSet := make(map[string]bool, len(have))
 	for _, s := range have {
@@ -794,8 +793,10 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 	}
 
 	if app.Servers == nil {
-		app.Servers = make(map[string]ServerConfig)
+		app.Servers = make(map[string]*ServerConfig)
 	}
+
+	isFirst := len(app.Servers) == 0
 
 	for d.Next() {
 		for d.NextBlock(0) {
@@ -808,7 +809,7 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 			}
 			serverName := d.Val()
 
-			var sc ServerConfig
+			sc := &ServerConfig{}
 			for d.NextBlock(1) {
 				switch d.Val() {
 				case "url":
@@ -840,7 +841,13 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 					return nil, d.Errf("unrecognized server option: %s", d.Val())
 				}
 			}
+
 			app.Servers[serverName] = sc
+			if isFirst || serverName == "default" {
+				app.Servers[""] = sc
+				app.Servers["default"] = sc
+				isFirst = false
+			}
 		}
 	}
 
