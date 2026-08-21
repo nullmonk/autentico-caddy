@@ -15,6 +15,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/coreos/go-oidc/v3/oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -87,21 +88,20 @@ func generateState() string {
 	return base64.URLEncoding.EncodeToString(b)
 }
 
-// accessTokenIdentity extracts the "preferred_username" (falling back to
-// "sub") and "role" claims from a JWT access token's payload without
-// verifying its signature. This is safe to call here because the token has
-// already been proven valid elsewhere (a successful login, or a successful
-// call against the OIDC provider's userinfo endpoint) - this only reads
-// claims (preferred_username, role) that the userinfo endpoint doesn't
-// expose.
-func accessTokenIdentity(token string) (username, role string) {
+// accessTokenIdentity extracts the "sub", "preferred_username", and "role"
+// claims from a JWT access token's payload without verifying its signature.
+// This is safe to call here because the token has already been proven valid
+// elsewhere (a successful login, or a successful call against the OIDC
+// provider's userinfo endpoint) - this only reads claims (preferred_username,
+// role) that the userinfo endpoint doesn't expose.
+func accessTokenIdentity(token string) (sub, preferredUsername, role string) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return "", ""
+		return "", "", ""
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	var claims struct {
 		Subject           string `json:"sub"`
@@ -109,13 +109,9 @@ func accessTokenIdentity(token string) (username, role string) {
 		Role              string `json:"role"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return "", ""
+		return "", "", ""
 	}
-	username = claims.PreferredUsername
-	if username == "" {
-		username = claims.Subject
-	}
-	return username, claims.Role
+	return claims.Subject, claims.PreferredUsername, claims.Role
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
@@ -202,6 +198,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	var authMethod string
 	var groups []string
 	var username string
+	var subject string
 
 	if mtlsReq == "require" {
 		authMethod = "mtls"
@@ -273,6 +270,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Fetch groups
 	if authMethod == "mtls" {
 		username = mtlsUsername
+		subject = mtlsCertSerial
 		// Use MTLS cert to fetch groups
 		cacheKey := fmt.Sprintf("mtls:%s:%s", mtlsCertSerial, a.ServerName)
 		if cachedGroups, ok := a.app.GetCachedGroups(cacheKey); ok {
@@ -297,7 +295,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				AccessToken: token,
 				TokenType:   "Bearer",
 			}
-			userInfo, err := state.Provider.UserInfo(r.Context(), oauth2.StaticTokenSource(oauth2Token))
+			userInfo, err := state.Provider.UserInfo(oidc.ClientContext(r.Context(), state.HTTPClient), oauth2.StaticTokenSource(oauth2Token))
 			if err != nil {
 				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
 				// Token might be invalid/expired, clear cookie if it came from one
@@ -332,7 +330,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			// valid by the successful userinfo call above) and fold the role in
 			// as an implicit group so `allow groups admin` matches on role as
 			// well as explicit group membership.
-			if _, role := accessTokenIdentity(token); role != "" {
+			if _, _, role := accessTokenIdentity(token); role != "" {
 				tokenGroups = append(tokenGroups, role)
 			}
 
@@ -340,15 +338,24 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			a.app.SetCachedGroups(token, tokenGroups, 5*time.Minute)
 		}
 
-		tokenUsername, _ := accessTokenIdentity(token)
+		tokenSub, tokenPreferredUsername, _ := accessTokenIdentity(token)
+		tokenUsername := tokenPreferredUsername
+		if tokenUsername == "" {
+			tokenUsername = tokenSub
+		}
 
 		if authMethod == "token" {
 			groups = tokenGroups
 			username = tokenUsername
+			subject = tokenSub
 		} else if authMethod == "both" {
 			username = tokenUsername
+			subject = tokenSub
 			if username == "" {
 				username = mtlsUsername
+			}
+			if subject == "" {
+				subject = mtlsCertSerial
 			}
 
 			// Merge groups from MTLS and Token
@@ -403,16 +410,38 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Expose the resolved identity so later directives (respond, templates,
 	// header, reverse_proxy header_up, etc.) can reference it via
 	// {http.vars.autentico.user}, {http.vars.autentico.groups}, and
-	// {http.vars.autentico.auth_method}.
+	// {http.vars.autentico.auth_method} - or as a single JSON object via
+	// {http.vars.autentico.json}.
 	caddyhttp.SetVar(r.Context(), "autentico.user", username)
 	caddyhttp.SetVar(r.Context(), "autentico.groups", strings.Join(groups, ","))
 	caddyhttp.SetVar(r.Context(), "autentico.auth_method", authMethod)
+
+	jsonGroups := groups
+	if jsonGroups == nil {
+		jsonGroups = []string{}
+	}
+	identity := struct {
+		Subject    string   `json:"sub"`
+		User       string   `json:"user"`
+		Groups     []string `json:"groups"`
+		AuthMethod string   `json:"auth_method"`
+	}{
+		Subject:    subject,
+		User:       username,
+		Groups:     jsonGroups,
+		AuthMethod: authMethod,
+	}
+	if identityJSON, err := json.Marshal(identity); err == nil {
+		caddyhttp.SetVar(r.Context(), "autentico.json", string(identityJSON))
+	} else {
+		a.logger.Warn("failed to marshal autentico identity", zap.Error(err))
+	}
 
 	return next.ServeHTTP(w, r)
 }
 
 func (a *Autentico) handleCallback(w http.ResponseWriter, r *http.Request, state *ServerState, oauthConfig oauth2.Config) error {
-	ctx := context.Background()
+	ctx := oidc.ClientContext(context.Background(), state.HTTPClient)
 
 	cookieState, err := r.Cookie("autentico_oauth_state")
 	if err != nil {

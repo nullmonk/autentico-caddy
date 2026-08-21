@@ -37,7 +37,15 @@ type ServerState struct {
 	Verifier       *oidc.IDTokenVerifier
 	CertPool       *x509.CertPool
 	CertsInstalled bool
-	mu             sync.Mutex
+	// HTTPClient trusts Caddy's internal PKI root(s) in addition to the
+	// system trust store (see (*App).buildTrustedClient), and must be used
+	// for every subsequent call to this server's OIDC provider (token
+	// exchange, jwks/userinfo, etc. via oidc.ClientContext) - not just the
+	// initial discovery request - otherwise those calls silently fall back
+	// to http.DefaultClient and fail TLS verification against a cert issued
+	// by Caddy's local CA.
+	HTTPClient *http.Client
+	mu         sync.Mutex
 
 	RedirectURIs []string
 }
@@ -107,6 +115,38 @@ func (a *App) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// buildTrustedClient returns an *http.Client whose root trust store is the
+// system cert pool plus Caddy's own internal PKI root certificate(s). ACO is
+// commonly reverse-proxied/issued a leaf cert by this same Caddy instance
+// (e.g. via `tls internal`), so calls that only trust the system pool -
+// including the stdlib's http.DefaultClient - fail with "certificate signed
+// by unknown authority" against it. The pool is rebuilt on every call rather
+// than cached, since Caddy's internal CA root may not exist yet the first
+// time this runs during startup.
+func (a *App) buildTrustedClient(timeout time.Duration) *http.Client {
+	pool, _ := x509.SystemCertPool()
+	if pool == nil {
+		pool = x509.NewCertPool()
+	}
+
+	if pkiAppIface, err := a.ctx.App("pki"); err == nil && pkiAppIface != nil {
+		if pkiApp, ok := pkiAppIface.(*caddypki.PKI); ok {
+			for _, ca := range pkiApp.CAs {
+				if ca.RootCertificate() != nil {
+					pool.AddCert(ca.RootCertificate())
+				}
+			}
+		}
+	}
+
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+	}
+}
+
 // GetServerState returns the OIDC configuration and provider for the server, initializing it if necessary
 func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerState, error) {
 	state, ok := a.serverStates[serverName]
@@ -136,7 +176,7 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		return nil, fmt.Errorf("failed to create discovery request: %w", err)
 	}
 
-	client := http.DefaultClient
+	client := a.buildTrustedClient(10 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch discovery document: %w", err)
@@ -154,13 +194,18 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		return nil, fmt.Errorf("failed to decode discovery document: %w", err)
 	}
 
-	providerCtx := oidc.InsecureIssuerURLContext(ctx, p.Issuer)
+	// Every subsequent call through this context (and any context derived
+	// from it) uses `client` instead of http.DefaultClient - required so the
+	// provider's own discovery fetch, and later jwks lookups, also trust
+	// Caddy's internal CA.
+	providerCtx := oidc.ClientContext(oidc.InsecureIssuerURLContext(ctx, p.Issuer), client)
 	provider, err := oidc.NewProvider(providerCtx, config.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize OIDC provider: %w", err)
 	}
 
 	state.Provider = provider
+	state.HTTPClient = client
 	state.Config = oauth2.Config{
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
@@ -429,29 +474,8 @@ func (a *App) Start() error {
 
 				success := false
 				for i, delay := range delays {
-					// Reload system cert pool on each retry to pick up new Caddy CA
-					pool, _ := x509.SystemCertPool()
-					if pool == nil {
-						pool = x509.NewCertPool()
-					}
-
-					// Get Caddy's internal PKI certificates
-					pkiAppIface, err := a.ctx.App("pki")
-					if err == nil && pkiAppIface != nil {
-						pkiApp := pkiAppIface.(*caddypki.PKI)
-						for _, ca := range pkiApp.CAs {
-							if ca.RootCertificate() != nil {
-								pool.AddCert(ca.RootCertificate())
-							}
-						}
-					}
-
-					client = &http.Client{
-						Timeout: 5 * time.Second,
-						Transport: &http.Transport{
-							TLSClientConfig: &tls.Config{RootCAs: pool},
-						},
-					}
+					// Rebuilt each retry to pick up Caddy's internal CA once it exists
+					client = a.buildTrustedClient(5 * time.Second)
 
 					resp, err = client.Do(req)
 					if err == nil && resp.StatusCode < 500 {
