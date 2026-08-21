@@ -19,6 +19,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddypki"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
@@ -36,6 +37,7 @@ type ServerState struct {
 	Verifier *oidc.IDTokenVerifier
 	CertPool *x509.CertPool
 	mu       sync.Mutex
+  CertsInstalled bool
 	Client   *http.Client
 
 	RedirectURIs []string
@@ -61,6 +63,7 @@ type TokenCacheEntry struct {
 type App struct {
 	Servers map[string]ServerConfig `json:"servers,omitempty"`
 
+	ctx          caddy.Context
 	logger       *zap.Logger
 	serverStates map[string]*ServerState
 	tokenCache   sync.Map // Token (string) -> *TokenCacheEntry
@@ -97,6 +100,7 @@ func (App) CaddyModule() caddy.ModuleInfo {
 
 // Provision implements caddy.Provisioner
 func (a *App) Provision(ctx caddy.Context) error {
+	a.ctx = ctx
 	a.logger = ctx.Logger()
 	a.serverStates = make(map[string]*ServerState)
 	for name, config := range a.Servers {
@@ -344,7 +348,7 @@ func (a *App) Start() error {
 			// Run in a background goroutine so it doesn't block Caddy's start up
 			go func() {
 				// 1. Health check
-				req, err := http.NewRequest("GET", config.URL+"/healthz", nil)
+				req, err := http.NewRequest("GET", config.URL+"/ca.crt", nil)
 				if err != nil {
 					a.logger.Error("failed to create autentico health check request", zap.Error(err), zap.String("server", name))
 					return
@@ -372,10 +376,26 @@ func (a *App) Start() error {
 				for i, delay := range delays {
 					// Reload system cert pool on each retry to pick up new Caddy CA
 					pool, _ := x509.SystemCertPool()
+TODO fix-insecure-https-10660734649392729994
 
 					tlsConfig := &tls.Config{RootCAs: pool}
 					if config.InsecureHTTPS {
 						tlsConfig.InsecureSkipVerify = true
+=======
+					if pool == nil {
+						pool = x509.NewCertPool()
+					}
+
+					// Get Caddy's internal PKI certificates
+					pkiAppIface, err := a.ctx.App("pki")
+					if err == nil && pkiAppIface != nil {
+						pkiApp := pkiAppIface.(*caddypki.PKI)
+						for _, ca := range pkiApp.CAs {
+							if ca.RootCertificate() != nil {
+								pool.AddCert(ca.RootCertificate())
+							}
+						}
+TODO dev
 					}
 
 					client = &http.Client{
@@ -386,8 +406,52 @@ func (a *App) Start() error {
 					}
 
 					resp, err = client.Do(req)
-					if err == nil && resp.StatusCode == http.StatusOK {
+					if err == nil && resp.StatusCode < 500 {
 						success = true
+
+						if resp.StatusCode == http.StatusOK && resp.Body != nil {
+							caBytes, readErr := io.ReadAll(resp.Body)
+							if readErr == nil {
+								state := a.serverStates[name]
+								state.mu.Lock()
+								if state.CertPool == nil {
+									state.CertPool = x509.NewCertPool()
+								}
+								if ok := state.CertPool.AppendCertsFromPEM(caBytes); ok {
+									state.CertsInstalled = true
+
+									// Check intermediaries for expiration
+									caBytesCopy := caBytes
+									for len(caBytesCopy) > 0 {
+										var block *pem.Block
+										block, caBytesCopy = pem.Decode(caBytesCopy)
+										if block == nil {
+											break
+										}
+										if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+											continue
+										}
+
+										cert, err := x509.ParseCertificate(block.Bytes)
+										if err != nil {
+											continue
+										}
+
+										// check if within a year of expiring
+										if cert.NotAfter.Sub(time.Now()) < 365*24*time.Hour {
+											a.logger.Warn("CA certificate within a year of expiring",
+												zap.String("server", name),
+												zap.String("subject", cert.Subject.CommonName),
+												zap.Time("expires", cert.NotAfter))
+										}
+									}
+								} else {
+									a.logger.Warn("failed to parse ca.crt PEM during health check", zap.String("server", name))
+								}
+								state.mu.Unlock()
+							}
+						}
+
 						if resp.Body != nil {
 							resp.Body.Close()
 						}
@@ -614,65 +678,15 @@ func (a *App) Start() error {
 							}
 						}
 					} else if feature == "mtls" || feature == "tls" {
-						// Fetch CA chain for MTLS/TLS
-						caReq, err := http.NewRequest("GET", config.URL+"/ca.crt", nil)
-						if err != nil {
-							a.logger.Error("failed to create ca.crt request", zap.Error(err), zap.String("server", name))
-							return
-						}
-						caResp, err := client.Do(caReq)
-						if err != nil {
-							a.logger.Error("failed to fetch ca.crt", zap.Error(err), zap.String("server", name))
-							return
-						}
-						defer caResp.Body.Close()
+						state := a.serverStates[name]
+						state.mu.Lock()
+						certsInstalled := state.CertsInstalled
+						state.mu.Unlock()
 
-						if caResp.StatusCode == http.StatusOK {
-							caBytes, err := io.ReadAll(caResp.Body)
-							if err != nil {
-								a.logger.Error("failed to read ca.crt response", zap.Error(err), zap.String("server", name))
-								return
-							}
-
-							// Parse and verify expiration
-							pool := x509.NewCertPool()
-							if ok := pool.AppendCertsFromPEM(caBytes); !ok {
-								a.logger.Error("failed to parse ca.crt PEM", zap.String("server", name))
-								return
-							}
-
-							// Check intermediaries for expiration
-							for len(caBytes) > 0 {
-								var block *pem.Block
-								block, caBytes = pem.Decode(caBytes)
-								if block == nil {
-									break
-								}
-								if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-									continue
-								}
-
-								cert, err := x509.ParseCertificate(block.Bytes)
-								if err != nil {
-									continue
-								}
-
-								// check if within a year of expiring
-								if cert.NotAfter.Sub(time.Now()) < 365*24*time.Hour {
-									a.logger.Warn("CA certificate within a year of expiring",
-										zap.String("server", name),
-										zap.String("subject", cert.Subject.CommonName),
-										zap.Time("expires", cert.NotAfter))
-								}
-							}
-
-							state := a.serverStates[name]
-							state.mu.Lock()
-							state.CertPool = pool
-							state.mu.Unlock()
-							a.logger.Info("autentico CA chain loaded successfully", zap.String("server", name))
+						if certsInstalled {
+							a.logger.Info("autentico CA chain loaded successfully for mtls/tls", zap.String("server", name))
 						} else {
-							a.logger.Warn("failed to fetch ca.crt, mtls might not work", zap.String("status", caResp.Status), zap.String("server", name))
+							a.logger.Warn("CA certificates are missing, mtls might not work", zap.String("server", name))
 						}
 					}
 				}
