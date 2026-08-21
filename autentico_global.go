@@ -739,27 +739,21 @@ func (a *App) Start() error {
 
 							// Client doesn't exist, create it
 							a.logger.Info("oidc client not found, attempting to create", zap.String("server", name), zap.String("client_id", config.ClientID))
-							// ACO rejects a blank redirect_uris list on creation. The real
-							// callback URL isn't known until a request arrives (it's derived
-							// from the request Host), so seed a placeholder here and let
-							// RegisterRedirectURI append the real one dynamically.
 							placeholderRedirectURI := "http://localhost/oauth2/callback"
 							createPayload := map[string]interface{}{
-								"client_id":                  config.ClientID,
-								"client_name":                "Caddy Autentico Plugin",
-								"redirect_uris":              []string{placeholderRedirectURI},
-								"response_types":             []string{"code"},
-								// ACO gates the "groups" claim in tokens/userinfo behind the
-								// "groups" scope being both requested and pre-registered on
-								// the client. Include it (plus the defaults ACO would use
-								// otherwise) so group-based `allow groups` checks work.
-								"scope": "openid profile email groups",
+								"client_id":      config.ClientID,
+								"client_name":    "Caddy Autentico Plugin",
+								"redirect_uris":  []string{placeholderRedirectURI},
+								"response_types": []string{"code"},
+								"scopes":         "openid profile email groups",
 							}
 							if config.ClientMode == "confidential" {
+								createPayload["client_type"] = "confidential"
 								createPayload["client_secret"] = config.ClientSecret
 								createPayload["grant_types"] = []string{"authorization_code", "client_credentials"}
 								createPayload["token_endpoint_auth_method"] = "client_secret_post"
 							} else {
+								createPayload["client_type"] = "public"
 								createPayload["grant_types"] = []string{"authorization_code"}
 								createPayload["token_endpoint_auth_method"] = "none"
 							}
