@@ -12,6 +12,27 @@ Take an API token and host and allow roles based authorization for caddy.
 * redirect auth to autentico
 * auto configure autentico client based on the domains configured
 
+## Installation
+
+The easiest way to use the `autentico` Caddy plugin is by using the pre-built Docker image.
+
+```yaml
+services:
+  caddy:
+    image: ghcr.io/nullmonk/autentico-caddy:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
+```
+
 ## Global Configuration
 
 The `autentico` Caddy plugin requires a global app configuration to define the connection to your autentico server(s). This is done in the global options block of your `Caddyfile`.
