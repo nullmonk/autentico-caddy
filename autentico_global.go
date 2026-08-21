@@ -318,11 +318,6 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 		return fmt.Errorf("server state %q not found", serverName)
 	}
 
-	clientID := config.ClientID
-	if clientID == "" {
-		clientID = "caddy.plugin.autentico"
-	}
-
 	state.mu.Lock()
 	// Double-check under lock
 	for _, u := range state.RedirectURIs {
@@ -346,7 +341,7 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 		return fmt.Errorf("failed to marshal redirect_uris update: %v", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "PUT", config.URL+"/admin/api/clients/"+clientID, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "PUT", config.URL+"/admin/api/clients/"+config.ClientID, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to create client update request: %v", err)
 	}
@@ -647,15 +642,9 @@ func (a *App) Start() error {
 				// 3. Feature-Specific Checks
 				for _, feature := range config.Features {
 					if feature == "oidc" {
-						// Test client secret
-						clientID := config.ClientID
-						if clientID == "" {
-							clientID = "caddy.plugin.autentico"
-						}
-
 						data := url.Values{}
 						data.Set("grant_type", "client_credentials")
-						data.Set("client_id", clientID)
+						data.Set("client_id", config.ClientID)
 						if config.ClientSecret != "" {
 							data.Set("client_secret", config.ClientSecret)
 						}
@@ -678,7 +667,7 @@ func (a *App) Start() error {
 							a.logger.Debug("autentico oidc client verified", zap.String("server", name))
 
 							// Fetch client details to populate RedirectURIs
-							clientReq, _ := http.NewRequest("GET", config.URL+"/admin/api/clients/"+clientID, nil)
+							clientReq, _ := http.NewRequest("GET", config.URL+"/admin/api/clients/"+config.ClientID, nil)
 							clientReq.Header.Set("Authorization", "Bearer "+config.APIToken)
 							clientResp, err := client.Do(clientReq)
 							if err == nil && clientResp.StatusCode == http.StatusOK {
@@ -695,20 +684,20 @@ func (a *App) Start() error {
 									// Clients created before the plugin requested the "groups"
 									// scope (or created manually) may be missing it, which
 									// silently drops the groups claim from tokens. Reconcile it.
-									ensureClientScopes(client, config, clientID, clientData.Scopes, a.logger, name)
+									ensureClientScopes(client, config, config.ClientID, clientData.Scopes, a.logger, name)
 								}
 								clientResp.Body.Close()
 							}
 						} else if tokenResp.StatusCode == http.StatusUnauthorized || tokenResp.StatusCode == http.StatusBadRequest {
 							// Client exists but secret might be wrong, OR it doesn't exist
 							// Let's check if it exists
-							clientReq, _ := http.NewRequest("GET", config.URL+"/admin/api/clients/"+clientID, nil)
+							clientReq, _ := http.NewRequest("GET", config.URL+"/admin/api/clients/"+config.ClientID, nil)
 							clientReq.Header.Set("Authorization", "Bearer "+config.APIToken)
 							clientResp, err := client.Do(clientReq)
 
 							if err == nil && clientResp.StatusCode == http.StatusOK {
 								// Client exists, but secret was wrong
-								a.logger.Error("oidc client secret is invalid", zap.String("server", name), zap.String("client_id", clientID))
+								a.logger.Error("oidc client secret is invalid", zap.String("server", name), zap.String("client_id", config.ClientID))
 								clientResp.Body.Close()
 								return
 							}
@@ -717,14 +706,14 @@ func (a *App) Start() error {
 							}
 
 							// Client doesn't exist, create it
-							a.logger.Info("oidc client not found, attempting to create", zap.String("server", name), zap.String("client_id", clientID))
+							a.logger.Info("oidc client not found, attempting to create", zap.String("server", name), zap.String("client_id", config.ClientID))
 							// ACO rejects a blank redirect_uris list on creation. The real
 							// callback URL isn't known until a request arrives (it's derived
 							// from the request Host), so seed a placeholder here and let
 							// RegisterRedirectURI append the real one dynamically.
 							placeholderRedirectURI := "http://localhost/oauth2/callback"
 							createPayload := map[string]interface{}{
-								"client_id":                  clientID,
+								"client_id":                  config.ClientID,
 								"client_name":                "Caddy Autentico Plugin",
 								"client_secret":              config.ClientSecret,
 								"redirect_uris":              []string{placeholderRedirectURI},
@@ -840,6 +829,10 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 				default:
 					return nil, d.Errf("unrecognized server option: %s", d.Val())
 				}
+			}
+
+			if sc.ClientID == "" {
+				sc.ClientID = "caddy.plugin.autentico"
 			}
 
 			app.Servers[serverName] = sc
