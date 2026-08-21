@@ -165,7 +165,12 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
 		Endpoint:     provider.Endpoint(),
-		Scopes:       []string{oidc.ScopeOpenID, "profile"},
+		// ACO only embeds the "groups" claim in the ID token / userinfo response
+		// when the "groups" scope was requested (see pkg/token/generate.go,
+		// pkg/userinfo/handler.go in the autentico server repo). Without it,
+		// `allow groups` checks against a token-authenticated user always see
+		// an empty group list.
+		Scopes: []string{oidc.ScopeOpenID, "profile", "groups"},
 	}
 	state.Verifier = provider.Verifier(&oidc.Config{ClientID: config.ClientID})
 
@@ -232,6 +237,7 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 		Data struct {
 			Items []struct {
 				Username string   `json:"username"`
+				Role     string   `json:"role"`
 				Groups   []string `json:"groups"`
 			} `json:"items"`
 		} `json:"data"`
@@ -245,7 +251,15 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 		return nil, fmt.Errorf("user not found")
 	}
 
-	return result.Data.Items[0].Groups, nil
+	// Fold the user's role in as an implicit group so `allow groups admin`
+	// matches on ACO role (e.g. "admin", "user") as well as explicit group
+	// membership.
+	item := result.Data.Items[0]
+	groups := item.Groups
+	if item.Role != "" {
+		groups = append(groups, item.Role)
+	}
+	return groups, nil
 }
 
 // RegisterRedirectURI dynamically registers a new callback URL for the OIDC client
@@ -308,6 +322,66 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 
 	a.logger.Info("dynamically registered new redirect URI", zap.String("server", serverName), zap.String("uri", callbackURL))
 	return nil
+}
+
+// requiredOIDCScopes are the scopes the OIDC client must have registered on ACO.
+// "groups" in particular gates the groups claim on the ID token / userinfo
+// response (see pkg/token/generate.go and pkg/userinfo/handler.go in the
+// autentico server) - without it, `allow groups` checks against a
+// token-authenticated user always see an empty group list.
+var requiredOIDCScopes = []string{"openid", "profile", "groups"}
+
+// ensureClientScopes checks the OIDC client's currently registered scopes against
+// requiredOIDCScopes and PUTs an update to add any that are missing, preserving
+// whatever scopes were already there.
+func ensureClientScopes(client *http.Client, config ServerConfig, clientID, currentScopes string, logger *zap.Logger, serverName string) {
+	have := strings.Fields(currentScopes)
+	haveSet := make(map[string]bool, len(have))
+	for _, s := range have {
+		haveSet[s] = true
+	}
+
+	newScopes := append([]string{}, have...)
+	changed := false
+	for _, s := range requiredOIDCScopes {
+		if !haveSet[s] {
+			newScopes = append(newScopes, s)
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+
+	payload := map[string]interface{}{"scopes": strings.Join(newScopes, " ")}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		logger.Error("failed to marshal client scope update", zap.Error(err), zap.String("server", serverName))
+		return
+	}
+
+	req, err := http.NewRequest("PUT", config.URL+"/admin/api/clients/"+clientID, bytes.NewReader(body))
+	if err != nil {
+		logger.Error("failed to create client scope update request", zap.Error(err), zap.String("server", serverName))
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+config.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Error("failed to update oidc client scopes", zap.Error(err), zap.String("server", serverName))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		logger.Error("failed to update oidc client scopes", zap.String("server", serverName), zap.String("status", resp.Status), zap.ByteString("response", respBody))
+		return
+	}
+
+	logger.Info("updated oidc client scopes", zap.String("server", serverName), zap.String("scopes", strings.Join(newScopes, " ")))
 }
 
 // Start implementing caddy.App
@@ -587,12 +661,18 @@ func (a *App) Start() error {
 							if err == nil && clientResp.StatusCode == http.StatusOK {
 								var clientData struct {
 									RedirectURIs []string `json:"redirect_uris"`
+									Scopes       string   `json:"scopes"`
 								}
 								if err := json.NewDecoder(clientResp.Body).Decode(&clientData); err == nil {
 									state := a.serverStates[name]
 									state.mu.Lock()
 									state.RedirectURIs = clientData.RedirectURIs
 									state.mu.Unlock()
+
+									// Clients created before the plugin requested the "groups"
+									// scope (or created manually) may be missing it, which
+									// silently drops the groups claim from tokens. Reconcile it.
+									ensureClientScopes(client, config, clientID, clientData.Scopes, a.logger, name)
 								}
 								clientResp.Body.Close()
 							}
@@ -628,6 +708,11 @@ func (a *App) Start() error {
 								"grant_types":                []string{"authorization_code", "client_credentials"},
 								"response_types":             []string{"code"},
 								"token_endpoint_auth_method": "client_secret_post",
+								// ACO gates the "groups" claim in tokens/userinfo behind the
+								// "groups" scope being both requested and pre-registered on
+								// the client. Include it (plus the defaults ACO would use
+								// otherwise) so group-based `allow groups` checks work.
+								"scope": "openid profile email groups",
 							}
 							createBody, _ := json.Marshal(createPayload)
 							createReq, err := http.NewRequest("POST", config.URL+"/admin/api/clients", bytes.NewReader(createBody))

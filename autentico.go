@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -84,6 +85,29 @@ func generateState() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return base64.URLEncoding.EncodeToString(b)
+}
+
+// roleFromAccessToken extracts the "role" claim from a JWT access token's
+// payload without verifying its signature. This is safe to call here because
+// the token has already been proven valid by a successful call against the
+// OIDC provider's userinfo endpoint - this only reads a claim (role) that
+// endpoint doesn't expose.
+func roleFromAccessToken(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Role
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
@@ -277,6 +301,13 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid token"))
 			}
 
+			if rawClaims := make(map[string]interface{}); userInfo.Claims(&rawClaims) == nil {
+				a.logger.Debug("dumping token claims for group check",
+					zap.String("server", a.ServerName),
+					zap.String("subject", userInfo.Subject),
+					zap.Any("claims", rawClaims))
+			}
+
 			var claims struct {
 				Groups []string `json:"groups"`
 			}
@@ -285,6 +316,15 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("invalid userinfo response"))
 			}
 			tokenGroups = claims.Groups
+
+			// ACO's userinfo endpoint doesn't expose the user's role, only the
+			// access token's own claims do. Decode it directly (already proven
+			// valid by the successful userinfo call above) and fold the role in
+			// as an implicit group so `allow groups admin` matches on role as
+			// well as explicit group membership.
+			if role := roleFromAccessToken(token); role != "" {
+				tokenGroups = append(tokenGroups, role)
+			}
 
 			// Cache it
 			a.app.SetCachedGroups(token, tokenGroups, 5*time.Minute)
