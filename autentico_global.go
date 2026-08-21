@@ -31,22 +31,24 @@ func init() {
 
 // ServerState holds runtime state for an autentico server
 type ServerState struct {
-	Provider *oidc.Provider
-	Config   oauth2.Config
-	Verifier *oidc.IDTokenVerifier
-	CertPool *x509.CertPool
-	mu       sync.Mutex
+	Provider   *oidc.Provider
+	Config     oauth2.Config
+	Verifier   *oidc.IDTokenVerifier
+	CertPool   *x509.CertPool
+	HTTPClient *http.Client
+	mu         sync.Mutex
 
 	RedirectURIs []string
 }
 
 // ServerConfig defines the configuration for an autentico server
 type ServerConfig struct {
-	URL          string   `json:"url,omitempty"`
-	ClientID     string   `json:"client_id,omitempty"`
-	ClientSecret string   `json:"client_secret,omitempty"`
-	APIToken     string   `json:"api_token,omitempty"`
-	Features     []string `json:"features,omitempty"`
+	URL           string   `json:"url,omitempty"`
+	ClientID      string   `json:"client_id,omitempty"`
+	ClientSecret  string   `json:"client_secret,omitempty"`
+	APIToken      string   `json:"api_token,omitempty"`
+	Features      []string `json:"features,omitempty"`
+	InsecureHTTPS bool     `json:"insecure_https,omitempty"`
 }
 
 // TokenCacheEntry stores a cached group resolution
@@ -97,8 +99,19 @@ func (App) CaddyModule() caddy.ModuleInfo {
 func (a *App) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
 	a.serverStates = make(map[string]*ServerState)
-	for name := range a.Servers {
-		a.serverStates[name] = &ServerState{}
+	for name, config := range a.Servers {
+		client := &http.Client{Timeout: 5 * time.Second}
+		if config.InsecureHTTPS {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{}
+			}
+			tr.TLSClientConfig.InsecureSkipVerify = true
+			client.Transport = tr
+		}
+		a.serverStates[name] = &ServerState{
+			HTTPClient: client,
+		}
 	}
 	return nil
 }
@@ -122,6 +135,7 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		return nil, fmt.Errorf("server configuration %q not found", serverName)
 	}
 
+	ctx = oidc.ClientContext(ctx, state.HTTPClient)
 	provider, err := oidc.NewProvider(ctx, config.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize OIDC provider: %w", err)
@@ -184,7 +198,10 @@ func (a *App) LookupUserGroups(ctx context.Context, serverName, username string)
 	req.Header.Set("Authorization", "Bearer "+config.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := a.serverStates[serverName].HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("lookup request failed: %v", err)
@@ -262,7 +279,10 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 	req.Header.Set("Authorization", "Bearer "+config.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := state.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("client update request failed: %v", err)
@@ -324,11 +344,17 @@ func (a *App) Start() error {
 				for i, delay := range delays {
 					// Reload system cert pool on each retry to pick up new Caddy CA
 					pool, _ := x509.SystemCertPool()
+
+					tr := &http.Transport{
+						TLSClientConfig: &tls.Config{RootCAs: pool},
+					}
+					if config.InsecureHTTPS {
+						tr.TLSClientConfig.InsecureSkipVerify = true
+					}
+
 					client = &http.Client{
 						Timeout: 5 * time.Second,
-						Transport: &http.Transport{
-							TLSClientConfig: &tls.Config{RootCAs: pool},
-						},
+						Transport: tr,
 					}
 
 					resp, err = client.Do(req)
@@ -693,6 +719,8 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 						return nil, d.ArgErr()
 					}
 					sc.APIToken = d.Val()
+				case "insecure_https":
+					sc.InsecureHTTPS = true
 				default:
 					return nil, d.Errf("unrecognized server option: %s", d.Val())
 				}
