@@ -55,6 +55,7 @@ type ServerConfig struct {
 	URL          string   `json:"url,omitempty"`
 	ClientID     string   `json:"client_id,omitempty"`
 	ClientSecret string   `json:"client_secret,omitempty"`
+	ClientMode   string   `json:"client_mode,omitempty"`
 	APIToken     string   `json:"api_token,omitempty"`
 	Features     []string `json:"features,omitempty"`
 }
@@ -108,8 +109,18 @@ func (a *App) Provision(ctx caddy.Context) error {
 	a.ctx = ctx
 	a.logger = ctx.Logger()
 	a.serverStates = make(map[string]*ServerState)
-	for name := range a.Servers {
+	for name, config := range a.Servers {
 		a.serverStates[name] = &ServerState{}
+
+		if config.ClientMode == "" {
+			config.ClientMode = "pkce"
+		}
+		if config.ClientMode != "pkce" && config.ClientMode != "confidential" {
+			return fmt.Errorf("invalid client_mode %q for server %q, expected 'pkce' or 'confidential'", config.ClientMode, name)
+		}
+		if config.ClientMode == "confidential" && config.ClientSecret == "" {
+			return fmt.Errorf("client_secret is required when client_mode is 'confidential' (server %q)", name)
+		}
 	}
 	return nil
 }
@@ -696,10 +707,31 @@ func (a *App) Start() error {
 							clientResp, err := client.Do(clientReq)
 
 							if err == nil && clientResp.StatusCode == http.StatusOK {
-								// Client exists, but secret was wrong
-								a.logger.Error("oidc client secret is invalid", zap.String("server", name), zap.String("client_id", config.ClientID))
-								clientResp.Body.Close()
-								return
+								if config.ClientMode == "confidential" {
+									// Client exists, but secret was wrong
+									a.logger.Error("oidc client secret is invalid", zap.String("server", name), zap.String("client_id", config.ClientID))
+									clientResp.Body.Close()
+									return
+								} else if config.ClientMode == "pkce" {
+									// Client exists, and we expect the token request to fail because
+									// PKCE clients shouldn't have the client_credentials grant type.
+									a.logger.Debug("autentico oidc pkce client verified", zap.String("server", name))
+
+									var clientData struct {
+										RedirectURIs []string `json:"redirect_uris"`
+										Scopes       string   `json:"scopes"`
+									}
+									if err := json.NewDecoder(clientResp.Body).Decode(&clientData); err == nil {
+										state := a.serverStates[name]
+										state.mu.Lock()
+										state.RedirectURIs = clientData.RedirectURIs
+										state.mu.Unlock()
+
+										ensureClientScopes(client, config, config.ClientID, clientData.Scopes, a.logger, name)
+									}
+									clientResp.Body.Close()
+									continue
+								}
 							}
 							if clientResp != nil && clientResp.Body != nil {
 								clientResp.Body.Close()
@@ -715,16 +747,21 @@ func (a *App) Start() error {
 							createPayload := map[string]interface{}{
 								"client_id":                  config.ClientID,
 								"client_name":                "Caddy Autentico Plugin",
-								"client_secret":              config.ClientSecret,
 								"redirect_uris":              []string{placeholderRedirectURI},
-								"grant_types":                []string{"authorization_code", "client_credentials"},
 								"response_types":             []string{"code"},
-								"token_endpoint_auth_method": "client_secret_post",
 								// ACO gates the "groups" claim in tokens/userinfo behind the
 								// "groups" scope being both requested and pre-registered on
 								// the client. Include it (plus the defaults ACO would use
 								// otherwise) so group-based `allow groups` checks work.
 								"scope": "openid profile email groups",
+							}
+							if config.ClientMode == "confidential" {
+								createPayload["client_secret"] = config.ClientSecret
+								createPayload["grant_types"] = []string{"authorization_code", "client_credentials"}
+								createPayload["token_endpoint_auth_method"] = "client_secret_post"
+							} else {
+								createPayload["grant_types"] = []string{"authorization_code"}
+								createPayload["token_endpoint_auth_method"] = "none"
 							}
 							createBody, _ := json.Marshal(createPayload)
 							createReq, err := http.NewRequest("POST", config.URL+"/admin/api/clients", bytes.NewReader(createBody))
@@ -816,6 +853,14 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 						return nil, d.ArgErr()
 					}
 					sc.ClientSecret = d.Val()
+				case "client_mode":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					sc.ClientMode = d.Val()
+					if sc.ClientMode != "pkce" && sc.ClientMode != "confidential" {
+						return nil, d.Errf("invalid client_mode %q, expected 'pkce' or 'confidential'", sc.ClientMode)
+					}
 				case "api_token", "API":
 					if d.Val() == "API" {
 						if !d.NextArg() || d.Val() != "token" {
