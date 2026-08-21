@@ -2,8 +2,8 @@ package autentico
 
 import (
 	"context"
-	"testing"
 	"github.com/caddyserver/caddy/v2"
+	"testing"
 )
 
 func TestAppProvision(t *testing.T) {
