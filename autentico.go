@@ -87,27 +87,35 @@ func generateState() string {
 	return base64.URLEncoding.EncodeToString(b)
 }
 
-// roleFromAccessToken extracts the "role" claim from a JWT access token's
-// payload without verifying its signature. This is safe to call here because
-// the token has already been proven valid by a successful call against the
-// OIDC provider's userinfo endpoint - this only reads a claim (role) that
-// endpoint doesn't expose.
-func roleFromAccessToken(token string) string {
+// accessTokenIdentity extracts the "preferred_username" (falling back to
+// "sub") and "role" claims from a JWT access token's payload without
+// verifying its signature. This is safe to call here because the token has
+// already been proven valid elsewhere (a successful login, or a successful
+// call against the OIDC provider's userinfo endpoint) - this only reads
+// claims (preferred_username, role) that the userinfo endpoint doesn't
+// expose.
+func accessTokenIdentity(token string) (username, role string) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return ""
+		return "", ""
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	var claims struct {
-		Role string `json:"role"`
+		Subject           string `json:"sub"`
+		PreferredUsername string `json:"preferred_username"`
+		Role              string `json:"role"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return ""
+		return "", ""
 	}
-	return claims.Role
+	username = claims.PreferredUsername
+	if username == "" {
+		username = claims.Subject
+	}
+	return username, claims.Role
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
@@ -193,6 +201,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// If "optional", we need at least one
 	var authMethod string
 	var groups []string
+	var username string
 
 	if mtlsReq == "require" {
 		authMethod = "mtls"
@@ -263,6 +272,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	// Fetch groups
 	if authMethod == "mtls" {
+		username = mtlsUsername
 		// Use MTLS cert to fetch groups
 		cacheKey := fmt.Sprintf("mtls:%s:%s", mtlsCertSerial, a.ServerName)
 		if cachedGroups, ok := a.app.GetCachedGroups(cacheKey); ok {
@@ -322,7 +332,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			// valid by the successful userinfo call above) and fold the role in
 			// as an implicit group so `allow groups admin` matches on role as
 			// well as explicit group membership.
-			if role := roleFromAccessToken(token); role != "" {
+			if _, role := accessTokenIdentity(token); role != "" {
 				tokenGroups = append(tokenGroups, role)
 			}
 
@@ -330,9 +340,17 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			a.app.SetCachedGroups(token, tokenGroups, 5*time.Minute)
 		}
 
+		tokenUsername, _ := accessTokenIdentity(token)
+
 		if authMethod == "token" {
 			groups = tokenGroups
+			username = tokenUsername
 		} else if authMethod == "both" {
+			username = tokenUsername
+			if username == "" {
+				username = mtlsUsername
+			}
+
 			// Merge groups from MTLS and Token
 			var mtlsGroups []string
 			cacheKey := fmt.Sprintf("mtls:%s:%s", mtlsCertSerial, a.ServerName)
@@ -381,6 +399,14 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("forbidden"))
 		}
 	}
+
+	// Expose the resolved identity so later directives (respond, templates,
+	// header, reverse_proxy header_up, etc.) can reference it via
+	// {http.vars.autentico.user}, {http.vars.autentico.groups}, and
+	// {http.vars.autentico.auth_method}.
+	caddyhttp.SetVar(r.Context(), "autentico.user", username)
+	caddyhttp.SetVar(r.Context(), "autentico.groups", strings.Join(groups, ","))
+	caddyhttp.SetVar(r.Context(), "autentico.auth_method", authMethod)
 
 	return next.ServeHTTP(w, r)
 }
