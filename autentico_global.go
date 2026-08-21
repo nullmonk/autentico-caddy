@@ -355,8 +355,16 @@ func (a *App) Start() error {
 					return
 				}
 
-				// 1.5 Validate API Token and Routes if APIToken is provided
-				if config.APIToken != "" {
+				// 1.5 Validate API Token and Routes if APIToken is provided and a feature requires it
+				tokenRequired := false
+				for _, f := range config.Features {
+					if f == "oidc" || f == "groups" {
+						tokenRequired = true
+						break
+					}
+				}
+
+				if config.APIToken != "" && tokenRequired {
 					parts := strings.Split(config.APIToken, ".")
 					if len(parts) == 3 {
 						payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -445,7 +453,7 @@ func (a *App) Start() error {
 							a.logger.Error("APIToken verification failed (invalid token or unauthorized)", zap.String("status", verifyResp.Status), zap.String("server", name))
 							return
 						}
-						a.logger.Info("autentico APIToken validated successfully", zap.String("server", name))
+						a.logger.Debug("autentico APIToken validated successfully", zap.String("server", name))
 
 					} else {
 						a.logger.Error("invalid APIToken format (expected JWT)", zap.String("server", name))
@@ -453,7 +461,9 @@ func (a *App) Start() error {
 					}
 				}
 
-				a.logger.Info("autentico health check successful", zap.String("server", name))
+				a.logger.Debug("autentico health check successful", zap.String("server", name))
+
+				a.logger.Debug("autentico features discovered", zap.String("server", name), zap.Strings("features", config.Features))
 
 				// 3. Feature-Specific Checks
 				for _, feature := range config.Features {
@@ -522,7 +532,7 @@ func (a *App) Start() error {
 							}
 
 							// Client doesn't exist, create it
-							a.logger.Info("oidc client not found, attempting to create", zap.String("server", name), zap.String("client_id", clientID))
+							a.logger.Debug("oidc client not found, attempting to create", zap.String("server", name), zap.String("client_id", clientID))
 							// ACO rejects a blank redirect_uris list on creation. The real
 							// callback URL isn't known until a request arrives (it's derived
 							// from the request Host), so seed a placeholder here and let
