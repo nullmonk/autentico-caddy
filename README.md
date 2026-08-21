@@ -47,7 +47,7 @@ The `autentico` Caddy plugin requires a global app configuration to define the c
         server default {
             url http://autentico:9999
             client_id my_caddy_client
-            client_secret super_secret_string
+            client_mode pkce
             api_token my_api_token
         }
 
@@ -55,6 +55,7 @@ The `autentico` Caddy plugin requires a global app configuration to define the c
         server other_server {
             url http://autentico-other:9999
             client_id other_client
+            client_mode confidential
             client_secret other_secret
             api_token other_token
         }
@@ -66,7 +67,8 @@ The `autentico` Caddy plugin requires a global app configuration to define the c
 
 * `url`: The base URL of the autentico server.
 * `client_id`: The OIDC client ID. If it does not exist, the plugin will attempt to create it. (Defaults to `caddy.plugin.autentico`)
-* `client_secret`: The OIDC client secret used for token requests.
+* `client_mode`: The OIDC client mode. Valid values are `pkce` (the default) or `confidential`.
+* `client_secret`: The OIDC client secret used for token requests (required only if `client_mode` is `confidential`).
 * `api_token` (or `API token`): The API token used to authenticate with the autentico API for health checks, group lookups, and dynamic client registration.
 
 ## HTTP Handler Directive (`autentico`)

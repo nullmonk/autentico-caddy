@@ -8,7 +8,7 @@
         server default {
             url http://authentico:9999
             client_id my_caddy_client
-            client_secret super_secret_string
+            client_mode pkce
             API token my_api_token
         }
 
@@ -16,6 +16,7 @@
         server other_server {
             url http://authentico-other:9999
             client_id other_client
+            client_mode confidential
             client_secret other_secret
             api_token other_token
         }

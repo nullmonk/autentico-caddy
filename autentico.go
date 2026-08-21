@@ -3,6 +3,7 @@ package autentico
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -124,6 +125,19 @@ func generateState() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return base64.URLEncoding.EncodeToString(b)
+}
+
+// generateCodeVerifier generates a PKCE code verifier
+func generateCodeVerifier() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// generateCodeChallenge generates a PKCE code challenge from a verifier
+func generateCodeChallenge(verifier string) string {
+	hash := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
 // accessTokenIdentity extracts the "sub", "preferred_username", and "role"
@@ -266,18 +280,39 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 
 		oauthState := generateState()
+		var verifier string
+		authOpts := []oauth2.AuthCodeOption{}
+
+		a.app.mu.Lock()
+		serverConfig := a.app.Servers[a.ServerName]
+		a.app.mu.Unlock()
+
+		if serverConfig != nil && serverConfig.ClientMode == "pkce" {
+			verifier = generateCodeVerifier()
+			challenge := generateCodeChallenge(verifier)
+			authOpts = append(authOpts,
+				oauth2.SetAuthURLParam("code_challenge", challenge),
+				oauth2.SetAuthURLParam("code_challenge_method", "S256"),
+			)
+		}
+
 		// Store the original URL to redirect back to after login
 		originalURL := r.URL.String()
+		cookieValue := fmt.Sprintf("%s|%s", oauthState, originalURL)
+		if verifier != "" {
+			cookieValue = fmt.Sprintf("%s|%s|%s", oauthState, originalURL, verifier)
+		}
+
 		http.SetCookie(w, &http.Cookie{
 			Name:     "autentico_oauth_state",
-			Value:    fmt.Sprintf("%s|%s", oauthState, originalURL),
+			Value:    cookieValue,
 			Path:     "/",
 			HttpOnly: true,
 			Secure:   scheme == "https",
 			MaxAge:   300,
 		})
 
-		url := oauthConfig.AuthCodeURL(oauthState)
+		url := oauthConfig.AuthCodeURL(oauthState, authOpts...)
 		http.Redirect(w, r, url, http.StatusFound)
 		return nil
 	}
@@ -526,17 +561,27 @@ func (a *Autentico) handleCallback(w http.ResponseWriter, r *http.Request, state
 		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("missing state cookie"))
 	}
 
-	parts := strings.SplitN(cookieState.Value, "|", 2)
-	if len(parts) != 2 {
+	parts := strings.Split(cookieState.Value, "|")
+	if len(parts) < 2 {
 		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("invalid state cookie format"))
 	}
 	expectedState, originalURL := parts[0], parts[1]
+
+	var verifier string
+	if len(parts) == 3 {
+		verifier = parts[2]
+	}
 
 	if r.URL.Query().Get("state") != expectedState {
 		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("invalid oauth state"))
 	}
 
-	oauth2Token, err := oauthConfig.Exchange(ctx, r.URL.Query().Get("code"))
+	authOpts := []oauth2.AuthCodeOption{}
+	if verifier != "" {
+		authOpts = append(authOpts, oauth2.SetAuthURLParam("code_verifier", verifier))
+	}
+
+	oauth2Token, err := oauthConfig.Exchange(ctx, r.URL.Query().Get("code"), authOpts...)
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("failed to exchange token: %v", err))
 	}
