@@ -122,7 +122,36 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		return nil, fmt.Errorf("server configuration %q not found", serverName)
 	}
 
-	provider, err := oidc.NewProvider(ctx, config.URL)
+	// We use InsecureIssuerURLContext to bypass the issuer validation mismatch.
+	// Since the server URL (config.URL) may differ from the `issuer` returned in the
+	// discovery document (e.g. `http://autentico` vs `http://localhost`), we must
+	// fetch the expected issuer ourselves first to inform go-oidc of what to accept.
+	wellKnown := strings.TrimSuffix(config.URL, "/") + "/.well-known/openid-configuration"
+	req, err := http.NewRequestWithContext(ctx, "GET", wellKnown, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery request: %w", err)
+	}
+
+	client := http.DefaultClient
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch discovery document: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discovery document returned status: %d", resp.StatusCode)
+	}
+
+	var p struct {
+		Issuer string `json:"issuer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return nil, fmt.Errorf("failed to decode discovery document: %w", err)
+	}
+
+	providerCtx := oidc.InsecureIssuerURLContext(ctx, p.Issuer)
+	provider, err := oidc.NewProvider(providerCtx, config.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize OIDC provider: %w", err)
 	}
