@@ -107,6 +107,22 @@ func (a *Autentico) Provision(ctx caddy.Context) error {
 
 	if hasGroups {
 		a.app.RegisterFeature(a.ServerName, "groups")
+
+		// The "groups" claim on the userinfo response (used for token-based
+		// auth) is only populated when the "groups" scope was requested (see
+		// ServerConfig.Scopes) - without it, group rules always see an empty
+		// group list for token-authenticated users.
+		hasGroupsScope := false
+		for _, s := range a.app.Servers[a.ServerName].Scopes {
+			if s == "groups" {
+				hasGroupsScope = true
+				break
+			}
+		}
+		if !hasGroupsScope {
+			a.logger.Warn("policy uses group/groups rules but the 'groups' scope is not configured for this server; token-authenticated users will always have an empty group list",
+				zap.String("server", a.ServerName))
+		}
 	}
 	if hasMTLS {
 		a.app.RegisterFeature(a.ServerName, "mtls")
@@ -521,13 +537,14 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	}
 
 	// Expose the resolved identity so later directives (respond, templates,
-	// header, reverse_proxy header_up, etc.) can reference it via
-	// {http.vars.autentico.user}, {http.vars.autentico.groups}, and
-	// {http.vars.autentico.auth_method} - or as a single JSON object via
-	// {http.vars.autentico.json}.
-	caddyhttp.SetVar(r.Context(), "autentico.user", username)
-	caddyhttp.SetVar(r.Context(), "autentico.groups", strings.Join(groups, ","))
-	caddyhttp.SetVar(r.Context(), "autentico.auth_method", authMethod)
+	// header, reverse_proxy header_up, matcher expressions, etc.) can
+	// reference it via {http.auth.autentico.user}, {http.auth.autentico.groups},
+	// and {http.auth.autentico.method} - or as a single JSON object via
+	// {http.auth.autentico.json}.
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl.Set("http.auth.autentico.user", username)
+	repl.Set("http.auth.autentico.groups", strings.Join(groups, ","))
+	repl.Set("http.auth.autentico.method", authMethod)
 
 	jsonGroups := groups
 	if jsonGroups == nil {
@@ -537,7 +554,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		Subject    string   `json:"sub"`
 		User       string   `json:"user"`
 		Groups     []string `json:"groups"`
-		AuthMethod string   `json:"auth_method"`
+		AuthMethod string   `json:"method"`
 	}{
 		Subject:    subject,
 		User:       username,
@@ -545,7 +562,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		AuthMethod: authMethod,
 	}
 	if identityJSON, err := json.Marshal(identity); err == nil {
-		caddyhttp.SetVar(r.Context(), "autentico.json", string(identityJSON))
+		repl.Set("http.auth.autentico.json", string(identityJSON))
 	} else {
 		a.logger.Warn("failed to marshal autentico identity", zap.Error(err))
 	}

@@ -58,7 +58,18 @@ type ServerConfig struct {
 	ClientMode   string   `json:"client_mode,omitempty"`
 	APIToken     string   `json:"api_token,omitempty"`
 	Features     []string `json:"features,omitempty"`
+	// Scopes are the OIDC scopes Caddy requests at login and requires the
+	// client to have registered on ACO. Defaults to defaultOIDCScopes
+	// ("email" is not included by default).
+	Scopes []string `json:"scopes,omitempty"`
 }
+
+// defaultOIDCScopes is used for a server when no `scopes` are configured.
+// "groups" in particular gates the groups claim on the ID token / userinfo
+// response (see pkg/token/generate.go and pkg/userinfo/handler.go in the
+// autentico server) - without it, `allow groups` checks against a
+// token-authenticated user always see an empty group list.
+var defaultOIDCScopes = []string{"openid", "profile", "groups"}
 
 // TokenCacheEntry stores a cached group resolution
 type TokenCacheEntry struct {
@@ -120,6 +131,10 @@ func (a *App) Provision(ctx caddy.Context) error {
 		}
 		if config.ClientMode == "confidential" && config.ClientSecret == "" {
 			return fmt.Errorf("client_secret is required when client_mode is 'confidential' (server %q)", name)
+		}
+
+		if len(config.Scopes) == 0 {
+			config.Scopes = append([]string{}, defaultOIDCScopes...)
 		}
 	}
 	return nil
@@ -220,12 +235,8 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
 		Endpoint:     provider.Endpoint(),
-		// ACO only embeds the "groups" claim in the ID token / userinfo response
-		// when the "groups" scope was requested (see pkg/token/generate.go,
-		// pkg/userinfo/handler.go in the autentico server repo). Without it,
-		// `allow groups` checks against a token-authenticated user always see
-		// an empty group list.
-		Scopes: []string{oidc.ScopeOpenID, "profile", "groups"},
+		// See ServerConfig.Scopes / defaultOIDCScopes.
+		Scopes: config.Scopes,
 	}
 	state.Verifier = provider.Verifier(&oidc.Config{ClientID: config.ClientID})
 
@@ -374,15 +385,8 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 	return nil
 }
 
-// requiredOIDCScopes are the scopes the OIDC client must have registered on ACO.
-// "groups" in particular gates the groups claim on the ID token / userinfo
-// response (see pkg/token/generate.go and pkg/userinfo/handler.go in the
-// autentico server) - without it, `allow groups` checks against a
-// token-authenticated user always see an empty group list.
-var requiredOIDCScopes = []string{"openid", "profile", "groups"}
-
 // ensureClientScopes checks the OIDC client's currently registered scopes against
-// requiredOIDCScopes and PUTs an update to add any that are missing, preserving
+// config.Scopes and PUTs an update to add any that are missing, preserving
 // whatever scopes were already there.
 func ensureClientScopes(client *http.Client, config *ServerConfig, clientID, currentScopes string, logger *zap.Logger, serverName string) {
 	have := strings.Fields(currentScopes)
@@ -393,7 +397,7 @@ func ensureClientScopes(client *http.Client, config *ServerConfig, clientID, cur
 
 	newScopes := append([]string{}, have...)
 	changed := false
-	for _, s := range requiredOIDCScopes {
+	for _, s := range config.Scopes {
 		if !haveSet[s] {
 			newScopes = append(newScopes, s)
 			changed = true
@@ -745,7 +749,7 @@ func (a *App) Start() error {
 								"client_name":    "Caddy Autentico Plugin",
 								"redirect_uris":  []string{placeholderRedirectURI},
 								"response_types": []string{"code"},
-								"scopes":         "openid profile email groups",
+								"scopes":         strings.Join(config.Scopes, " "),
 							}
 							if config.ClientMode == "confidential" {
 								createPayload["client_type"] = "confidential"
@@ -855,12 +859,13 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 					if sc.ClientMode != "pkce" && sc.ClientMode != "confidential" {
 						return nil, d.Errf("invalid client_mode %q, expected 'pkce' or 'confidential'", sc.ClientMode)
 					}
-				case "api_token", "API":
-					if d.Val() == "API" {
-						if !d.NextArg() || d.Val() != "token" {
-							return nil, d.Err("expected 'token' after 'API'")
-						}
+				case "scopes":
+					scopes := d.RemainingArgs()
+					if len(scopes) == 0 {
+						return nil, d.ArgErr()
 					}
+					sc.Scopes = scopes
+				case "api_token":
 					if !d.NextArg() {
 						return nil, d.ArgErr()
 					}

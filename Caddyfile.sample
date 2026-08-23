@@ -9,7 +9,10 @@
             url http://authentico:9999
             client_id my_caddy_client
             client_mode pkce
-            API token my_api_token
+            api_token my_api_token
+            # Scopes requested at login and required on the OIDC client.
+            # Defaults to "openid profile groups" if omitted ("email" is not
+            # requested by default).
         }
 
         # Configure an additional server to demonstrate multi-server support
@@ -19,6 +22,7 @@
             client_mode confidential
             client_secret other_secret
             api_token other_token
+            scopes openid profile email groups
         }
     }
 }
