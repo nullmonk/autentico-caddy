@@ -44,9 +44,12 @@ type Autentico struct {
 	ServerName         string   `json:"server_name,omitempty"`
 	Policies           []Policy `json:"policies,omitempty"`
 	CallbackPath       string   `json:"callback_path,omitempty"`
-	CookieDomain       string   `json:"cookie_domain,omitempty"`
-	ErrorRespondBody   string   `json:"error_respond_body,omitempty"`
-	ErrorRespondStatus int      `json:"error_respond_status,omitempty"`
+	CookieDomain        string   `json:"cookie_domain,omitempty"`
+	ErrorRespondBody    string   `json:"error_respond_body,omitempty"`
+	ErrorRespondStatus  int      `json:"error_respond_status,omitempty"`
+	IsExternal          bool     `json:"is_external,omitempty"`
+	ExternalTokenSource string   `json:"external_token_source,omitempty"`
+	ExternalCookieName  string   `json:"external_cookie_name,omitempty"`
 
 	app    *App
 	logger *zap.Logger
@@ -241,10 +244,22 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	// Extract Bearer token
 	token := ""
-	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
-		token = strings.TrimPrefix(authHeader, "Bearer ")
-	} else if cookie, err := r.Cookie("autentico_token"); err == nil {
-		token = cookie.Value
+	if a.IsExternal {
+		if a.ExternalTokenSource == "cookie" {
+			if cookie, err := r.Cookie(a.ExternalCookieName); err == nil {
+				token = cookie.Value
+			}
+		} else if a.ExternalTokenSource == "bearer" {
+			if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+				token = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+	} else {
+		if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if cookie, err := r.Cookie("autentico_token"); err == nil {
+			token = cookie.Value
+		}
 	}
 
 	tokenValid := token != ""
@@ -264,7 +279,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		authMethod = "missing_token"
 	}
 
-	if authMethod == "missing_token" {
+	if authMethod == "missing_token" && !a.IsExternal {
 		if a.ErrorRespondBody != "" {
 			w.WriteHeader(a.ErrorRespondStatus)
 			w.Write([]byte(a.ErrorRespondBody))
@@ -364,6 +379,13 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			userInfo, err := state.Provider.UserInfo(oidc.ClientContext(r.Context(), state.HTTPClient), oauth2.StaticTokenSource(oauth2Token))
 			if err != nil {
 				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
+
+				if a.IsExternal {
+					authMethod = "invalid"
+					tokenValid = false
+					goto skip_token_processing
+				}
+
 				// Token might be invalid/expired, clear cookie if it came from one
 				http.SetCookie(w, &http.Cookie{
 					Name:     "autentico_token",
@@ -453,10 +475,18 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 	}
 
-	// 3. Evaluate Policies
-	// If no policies exist, we should probably allow since it's just authentication.
-	// But let's check policies. First-match-wins logic. Default is deny if they fall through.
-	if len(a.Policies) > 0 {
+skip_token_processing:
+
+	// If external and token is missing or invalid, do not evaluate policies or reject.
+	if a.IsExternal && (authMethod == "missing_token" || authMethod == "invalid") {
+		if authMethod == "missing_token" {
+			authMethod = "unauthenticated"
+		}
+		// Bypass policy evaluation and let the request continue
+	} else if len(a.Policies) > 0 && !a.IsExternal {
+		// 3. Evaluate Policies
+		// If no policies exist, we should probably allow since it's just authentication.
+		// But let's check policies. First-match-wins logic. Default is deny if they fall through.
 		allowed := false
 		matched := false
 
@@ -527,12 +557,21 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 
 		if !allowed {
-			if a.ErrorRespondBody != "" {
-				w.WriteHeader(a.ErrorRespondStatus)
-				w.Write([]byte(a.ErrorRespondBody))
-				return nil
+			// Do not return Forbidden if external flag is set, instead just pass through
+			if a.IsExternal {
+				// We actually shouldn't hit this path because we bypass policies for missing/invalid token
+				// but just in case, we still don't want to interrupt flow for external tokens that fail policy checks
+				// Wait, if it IS external and the token IS valid, but it fails a policy... the user requested:
+				// "Yes skip the policy enforement, just extract the variables"
+				// So if IsExternal, we actually shouldn't evaluate policies at all.
+			} else {
+				if a.ErrorRespondBody != "" {
+					w.WriteHeader(a.ErrorRespondStatus)
+					w.Write([]byte(a.ErrorRespondBody))
+					return nil
+				}
+				return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("forbidden"))
 			}
-			return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("forbidden"))
 		}
 	}
 
@@ -546,6 +585,12 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	repl.Set("http.auth.autentico.groups", strings.Join(groups, ","))
 	repl.Set("http.auth.autentico.method", authMethod)
 
+	if a.IsExternal {
+		repl.Set("http.auth.autentico.external", "true")
+	} else {
+		repl.Set("http.auth.autentico.external", "false")
+	}
+
 	jsonGroups := groups
 	if jsonGroups == nil {
 		jsonGroups = []string{}
@@ -555,11 +600,13 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		User       string   `json:"user"`
 		Groups     []string `json:"groups"`
 		AuthMethod string   `json:"method"`
+		External   bool     `json:"external"`
 	}{
 		Subject:    subject,
 		User:       username,
 		Groups:     jsonGroups,
 		AuthMethod: authMethod,
+		External:   a.IsExternal,
 	}
 	if identityJSON, err := json.Marshal(identity); err == nil {
 		repl.Set("http.auth.autentico.json", string(identityJSON))
@@ -701,9 +748,9 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 
 		if len(args) > 0 {
-			// First argument could be server_name, allow, deny, etc.
+			// First argument could be server_name, allow, deny, external, etc.
 			firstArg := args[0]
-			if firstArg != "allow" && firstArg != "deny" && firstArg != "require_all" && firstArg != "callback_path" && firstArg != "cookie_domain" && firstArg != "error_respond" {
+			if firstArg != "allow" && firstArg != "deny" && firstArg != "require_all" && firstArg != "callback_path" && firstArg != "cookie_domain" && firstArg != "error_respond" && firstArg != "external" {
 				a.ServerName = firstArg
 				args = args[1:]
 			}
@@ -717,6 +764,22 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("inline rule error: %v", err)
 				}
 				a.Policies = append(a.Policies, Policy{Rules: []Rule{rule}})
+			} else if action == "external" {
+				a.IsExternal = true
+				if len(args) > 1 {
+					a.ExternalTokenSource = args[1]
+					if a.ExternalTokenSource == "cookie" {
+						if len(args) > 2 {
+							a.ExternalCookieName = args[2]
+						} else {
+							return d.Errf("expected cookie name after 'external cookie'")
+						}
+					} else if a.ExternalTokenSource != "bearer" {
+						return d.Errf("expected 'cookie <name>' or 'bearer' after 'external', got '%s'", a.ExternalTokenSource)
+					}
+				} else {
+					return d.Errf("expected 'cookie <name>' or 'bearer' after 'external'")
+				}
 			} else {
 				return d.Errf("unrecognized inline argument: %s", action)
 			}
@@ -773,6 +836,21 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					a.ErrorRespondStatus = status
 				} else {
 					a.ErrorRespondStatus = 403 // Default to 403 Forbidden
+				}
+
+			case "external":
+				a.IsExternal = true
+				if !d.NextArg() {
+					return d.Errf("expected 'cookie <name>' or 'bearer' after 'external'")
+				}
+				a.ExternalTokenSource = d.Val()
+				if a.ExternalTokenSource == "cookie" {
+					if !d.NextArg() {
+						return d.Errf("expected cookie name after 'external cookie'")
+					}
+					a.ExternalCookieName = d.Val()
+				} else if a.ExternalTokenSource != "bearer" {
+					return d.Errf("expected 'cookie <name>' or 'bearer' after 'external', got '%s'", a.ExternalTokenSource)
 				}
 
 			default:
