@@ -152,7 +152,41 @@ After successful authentication, the `autentico` handler sets several placeholde
 * `{http.auth.autentico.user}`: The authenticated user's name (either the OIDC preferred username/sub or the MTLS certificate Common Name).
 * `{http.auth.autentico.groups}`: A comma-separated list of the user's groups.
 * `{http.auth.autentico.method}`: The method used for authentication (`token`, `mtls`, or `both`).
-* `{http.auth.autentico.json}`: A JSON object containing all the identity information (subject, user, groups, method).
+* `{http.auth.autentico.json}`: A JSON object containing all the identity information (subject, user, groups, method, external).
+* `{http.auth.autentico.external}`: A boolean string (`"true"` or `"false"`) indicating whether the request was authenticated via an external token source.
+
+## External Token Configuration
+
+The `external` directive lets `autentico` validate tokens managed by an external application, without intercepting requests to redirect to the OAuth flow or enforcing internal policies. This is useful for passing through externally-managed authentication checks for upstream routing.
+
+When `external` is active, the plugin simply acts as an identity extractor and populates the Caddy variables.
+
+### External Options
+
+* `external cookie <cookie_name>`: Extracts the token from the specified cookie (or the Authorization header).
+* `external bearer`: Extracts the token exclusively from the Authorization header.
+
+### Examples
+
+**Block syntax:**
+
+```caddyfile
+books.localhost {
+    autentico {
+        external cookie openid_id_token
+    }
+    reverse_proxy http://audiobookshelf
+}
+```
+
+**Inline syntax:**
+
+```caddyfile
+books.localhost {
+    autentico external cookie openid_id_token
+    reverse_proxy http://audiobookshelf
+}
+```
 
 ## Advanced Examples
 
