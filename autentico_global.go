@@ -23,6 +23,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 func init() {
@@ -32,11 +33,22 @@ func init() {
 
 // ServerState holds runtime state for an autentico server
 type ServerState struct {
-	Provider       *oidc.Provider
-	Config         oauth2.Config
-	Verifier       *oidc.IDTokenVerifier
-	CertPool       *x509.CertPool
-	CertsInstalled bool
+	Provider *oidc.Provider
+	Config   oauth2.Config
+	Verifier *oidc.IDTokenVerifier
+	// ExternalVerifier checks the signature/issuer (but not audience) of an
+	// ID token issued by this provider to some *other* OAuth client - e.g.
+	// the app autentico sits in front of in "external" mode, which already
+	// did its own login and just hands autentico that token to read
+	// identity from. Audience can't be checked against this server's own
+	// ClientID because the token was never issued to it.
+	ExternalVerifier *oidc.IDTokenVerifier
+	// ExternalVerifierAllowExpired is ExternalVerifier but also tolerates
+	// an expired token, so callers can tell "expired but otherwise
+	// legitimate" apart from "genuinely invalid" (bad signature/issuer).
+	ExternalVerifierAllowExpired *oidc.IDTokenVerifier
+	CertPool                     *x509.CertPool
+	CertsInstalled               bool
 	// HTTPClient trusts Caddy's internal PKI root(s) in addition to the
 	// system trust store (see (*App).buildTrustedClient), and must be used
 	// for every subsequent call to this server's OIDC provider (token
@@ -86,6 +98,28 @@ type App struct {
 	serverStates map[string]*ServerState
 	tokenCache   sync.Map // Token (string) -> *TokenCacheEntry
 	mu           sync.Mutex
+
+	// userInfoGroup deduplicates concurrent userinfo lookups for the same
+	// token (see FetchUserInfoGroups) so a burst of simultaneous requests
+	// sharing one cold cache entry - e.g. a page load's parallel asset
+	// requests - triggers at most one upstream call instead of tripping
+	// the OIDC provider's rate limit.
+	userInfoGroup singleflight.Group
+	// userInfoFailures short-circuits repeat userinfo calls for a token that
+	// just failed (e.g. the provider is rate-limiting us), so a steady
+	// trickle of sequential requests - which singleflight alone can't
+	// dedupe, since each arrives after the last one's Do call already
+	// completed - doesn't keep re-triggering the same failure indefinitely.
+	userInfoFailures sync.Map // token (string) -> *userInfoFailure
+}
+
+// userInfoFailureTTL is how long a failed userinfo lookup is remembered so
+// callers back off instead of retrying immediately.
+const userInfoFailureTTL = 10 * time.Second
+
+type userInfoFailure struct {
+	err error
+	at  time.Time
 }
 
 // RegisterFeature adds a feature to the server config if it doesn't already exist
@@ -239,8 +273,43 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		Scopes: config.Scopes,
 	}
 	state.Verifier = provider.Verifier(&oidc.Config{ClientID: config.ClientID})
+	state.ExternalVerifier = provider.Verifier(&oidc.Config{SkipClientIDCheck: true})
+	state.ExternalVerifierAllowExpired = provider.Verifier(&oidc.Config{SkipClientIDCheck: true, SkipExpiryCheck: true})
 
 	return state, nil
+}
+
+// VerifyExternalIDToken locally verifies a foreign ID token (see
+// ServerState.ExternalVerifier) and extracts its groups/roles claims. No
+// network call is made beyond what the oidc package needs to keep the
+// provider's signing keys fresh (jwks), which it caches internally - unlike
+// FetchUserInfoGroups, this never calls the userinfo endpoint, which many
+// providers correctly reject an ID token against regardless of validity.
+//
+// expired is true when the token's signature/issuer check out but it has
+// simply timed out; err is non-nil only for a genuinely invalid token (bad
+// signature, wrong issuer, malformed) or one that isn't a JWT this
+// provider issued at all (e.g. an opaque external bearer token).
+func (a *App) VerifyExternalIDToken(ctx context.Context, state *ServerState, token string) (groups []string, expired bool, rawClaims map[string]interface{}, err error) {
+	idToken, verifyErr := state.ExternalVerifier.Verify(ctx, token)
+	if verifyErr != nil {
+		idToken, err = state.ExternalVerifierAllowExpired.Verify(ctx, token)
+		if err != nil {
+			return nil, false, nil, verifyErr
+		}
+		expired = true
+	}
+
+	rawClaims = make(map[string]interface{})
+	idToken.Claims(&rawClaims)
+
+	var claims struct {
+		Groups []string `json:"groups"`
+		Roles  []string `json:"roles"`
+	}
+	idToken.Claims(&claims)
+
+	return append(claims.Groups, claims.Roles...), expired, rawClaims, nil
 }
 
 // GetCachedGroups retrieves groups from the cache if not expired
@@ -261,6 +330,74 @@ func (a *App) SetCachedGroups(token string, groups []string, ttl time.Duration) 
 		Groups:    groups,
 		ExpiresAt: time.Now().Add(ttl),
 	})
+}
+
+// UserInfoResult holds the outcome of a resolved userinfo lookup.
+type UserInfoResult struct {
+	Subject   string
+	Groups    []string
+	RawClaims map[string]interface{}
+}
+
+// unmarshalClaimsError distinguishes a malformed userinfo response (our
+// bug/provider contract mismatch) from a failed or rejected upstream call
+// (invalid/expired token, network error, rate limit, ...) so callers can
+// respond with the right status code.
+type unmarshalClaimsError struct{ err error }
+
+func (e *unmarshalClaimsError) Error() string { return e.err.Error() }
+func (e *unmarshalClaimsError) Unwrap() error { return e.err }
+
+// FetchUserInfoGroups resolves the groups claim (folded together with the
+// access token's role claim, see accessTokenIdentity) from the OIDC
+// provider's userinfo endpoint, and caches it for ttl. Concurrent calls for
+// the same token are deduplicated via singleflight so only one upstream
+// request is made no matter how many requests race in on a cold cache.
+func (a *App) FetchUserInfoGroups(ctx context.Context, httpClient *http.Client, provider *oidc.Provider, token string, ttl time.Duration) (*UserInfoResult, error) {
+	if v, ok := a.userInfoFailures.Load(token); ok {
+		f := v.(*userInfoFailure)
+		if time.Since(f.at) < userInfoFailureTTL {
+			return nil, f.err
+		}
+		a.userInfoFailures.Delete(token)
+	}
+
+	v, err, _ := a.userInfoGroup.Do(token, func() (interface{}, error) {
+		oauth2Token := &oauth2.Token{
+			AccessToken: token,
+			TokenType:   "Bearer",
+		}
+		userInfo, err := provider.UserInfo(oidc.ClientContext(ctx, httpClient), oauth2.StaticTokenSource(oauth2Token))
+		if err != nil {
+			a.userInfoFailures.Store(token, &userInfoFailure{err: err, at: time.Now()})
+			return nil, err
+		}
+
+		rawClaims := make(map[string]interface{})
+		userInfo.Claims(&rawClaims)
+
+		var claims struct {
+			Groups []string `json:"groups"`
+		}
+		if err := userInfo.Claims(&claims); err != nil {
+			wrapped := &unmarshalClaimsError{err}
+			a.userInfoFailures.Store(token, &userInfoFailure{err: wrapped, at: time.Now()})
+			return nil, wrapped
+		}
+
+		groups := claims.Groups
+		if _, _, role := accessTokenIdentity(token); role != "" {
+			groups = append(groups, role)
+		}
+
+		a.SetCachedGroups(token, groups, ttl)
+
+		return &UserInfoResult{Subject: userInfo.Subject, Groups: groups, RawClaims: rawClaims}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*UserInfoResult), nil
 }
 
 // LookupUserGroups fetches user groups from the Autentico admin API
