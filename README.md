@@ -69,7 +69,8 @@ The `autentico` Caddy plugin requires a global app configuration to define the c
 * `client_id`: The OIDC client ID. If it does not exist, the plugin will attempt to create it. (Defaults to `caddy.plugin.autentico`)
 * `client_mode`: The OIDC client mode. Valid values are `pkce` (the default) or `confidential`.
 * `client_secret`: The OIDC client secret used for token requests (required only if `client_mode` is `confidential`).
-* `api_token` (or `API token`): The API token used to authenticate with the autentico API for health checks, group lookups, and dynamic client registration.
+* `api_token`: The API token used to authenticate with the autentico API for health checks, group lookups, and dynamic client registration.
+* `scopes`: The OIDC scopes Caddy requests at login and requires the client to have registered on ACO. Defaults to `openid profile groups` (`email` is not requested by default - add it explicitly if you need it, e.g. `scopes openid profile email groups`).
 
 ## HTTP Handler Directive (`autentico`)
 
@@ -146,12 +147,46 @@ example.com {
 
 ## Exported Caddy Variables
 
-After successful authentication, the `autentico` handler sets several variables in the request context that you can use in subsequent directives (like `respond`, `templates`, or `reverse_proxy header_up`).
+After successful authentication, the `autentico` handler sets several placeholders that you can use in subsequent directives (like `respond`, `templates`, `reverse_proxy header_up`, or matcher expressions).
 
-* `{http.vars.autentico.user}`: The authenticated user's name (either the OIDC preferred username/sub or the MTLS certificate Common Name).
-* `{http.vars.autentico.groups}`: A comma-separated list of the user's groups.
-* `{http.vars.autentico.auth_method}`: The method used for authentication (`token`, `mtls`, or `both`).
-* `{http.vars.autentico.json}`: A JSON object containing all the identity information (subject, user, groups, auth_method).
+* `{http.auth.autentico.user}`: The authenticated user's name (either the OIDC preferred username/sub or the MTLS certificate Common Name).
+* `{http.auth.autentico.groups}`: A comma-separated list of the user's groups.
+* `{http.auth.autentico.method}`: The method used for authentication (`token`, `mtls`, or `both`).
+* `{http.auth.autentico.json}`: A JSON object containing all the identity information (subject, user, groups, method, external).
+* `{http.auth.autentico.external}`: A boolean string (`"true"` or `"false"`) indicating whether the request was authenticated via an external token source.
+
+## External Token Configuration
+
+The `external` directive lets `autentico` validate tokens managed by an external application, without intercepting requests to redirect to the OAuth flow or enforcing internal policies. This is useful for passing through externally-managed authentication checks for upstream routing.
+
+When `external` is active, the plugin simply acts as an identity extractor and populates the Caddy variables.
+
+### External Options
+
+* `external cookie <cookie_name>`: Extracts the token from the specified cookie (or the Authorization header).
+* `external bearer`: Extracts the token exclusively from the Authorization header.
+
+### Examples
+
+**Block syntax:**
+
+```caddyfile
+books.localhost {
+    autentico {
+        external cookie openid_id_token
+    }
+    reverse_proxy http://audiobookshelf
+}
+```
+
+**Inline syntax:**
+
+```caddyfile
+books.localhost {
+    autentico external cookie openid_id_token
+    reverse_proxy http://audiobookshelf
+}
+```
 
 ## Advanced Examples
 
@@ -174,7 +209,7 @@ auth.wb.localhost {
             mtls optional
             callback_path /whoami/callback
         }
-        respond "{http.vars.autentico.json}" 200
+        respond "{http.auth.autentico.json}" 200
     }
 
     route {
@@ -185,7 +220,7 @@ auth.wb.localhost {
 
 ### Split routing depending on auth method
 
-You can use Caddy's expression matchers against the raw `autentico.auth_method` variable to route traffic differently depending on how the user authenticated.
+You can use Caddy's `expression` matcher against the `{http.auth.autentico.method}` placeholder to route traffic differently depending on how the user authenticated.
 
 ```caddyfile
 example.com {
@@ -200,16 +235,14 @@ example.com {
             mtls optional
         }
 
-        # Matches the raw variable autentico sets via caddyhttp.SetVar - no
-        # {} needed here, that's only for placeholder-string values.
-        @mtls vars autentico.auth_method mtls
-        @token vars autentico.auth_method token both
+        @mtls expression {http.auth.autentico.method} == "mtls"
+        @token expression {http.auth.autentico.method} in ["token", "both"]
 
         handle @mtls {
-            respond "cert auth: {http.vars.autentico.user}" 200
+            respond "cert auth: {http.auth.autentico.user}" 200
         }
         handle @token {
-            respond "token auth: {http.vars.autentico.user}" 200
+            respond "token auth: {http.auth.autentico.user}" 200
         }
     }
 }

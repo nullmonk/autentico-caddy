@@ -23,6 +23,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 func init() {
@@ -32,11 +33,22 @@ func init() {
 
 // ServerState holds runtime state for an autentico server
 type ServerState struct {
-	Provider       *oidc.Provider
-	Config         oauth2.Config
-	Verifier       *oidc.IDTokenVerifier
-	CertPool       *x509.CertPool
-	CertsInstalled bool
+	Provider *oidc.Provider
+	Config   oauth2.Config
+	Verifier *oidc.IDTokenVerifier
+	// ExternalVerifier checks the signature/issuer (but not audience) of an
+	// ID token issued by this provider to some *other* OAuth client - e.g.
+	// the app autentico sits in front of in "external" mode, which already
+	// did its own login and just hands autentico that token to read
+	// identity from. Audience can't be checked against this server's own
+	// ClientID because the token was never issued to it.
+	ExternalVerifier *oidc.IDTokenVerifier
+	// ExternalVerifierAllowExpired is ExternalVerifier but also tolerates
+	// an expired token, so callers can tell "expired but otherwise
+	// legitimate" apart from "genuinely invalid" (bad signature/issuer).
+	ExternalVerifierAllowExpired *oidc.IDTokenVerifier
+	CertPool                     *x509.CertPool
+	CertsInstalled               bool
 	// HTTPClient trusts Caddy's internal PKI root(s) in addition to the
 	// system trust store (see (*App).buildTrustedClient), and must be used
 	// for every subsequent call to this server's OIDC provider (token
@@ -58,7 +70,18 @@ type ServerConfig struct {
 	ClientMode   string   `json:"client_mode,omitempty"`
 	APIToken     string   `json:"api_token,omitempty"`
 	Features     []string `json:"features,omitempty"`
+	// Scopes are the OIDC scopes Caddy requests at login and requires the
+	// client to have registered on ACO. Defaults to defaultOIDCScopes
+	// ("email" is not included by default).
+	Scopes []string `json:"scopes,omitempty"`
 }
+
+// defaultOIDCScopes is used for a server when no `scopes` are configured.
+// "groups" in particular gates the groups claim on the ID token / userinfo
+// response (see pkg/token/generate.go and pkg/userinfo/handler.go in the
+// autentico server) - without it, `allow groups` checks against a
+// token-authenticated user always see an empty group list.
+var defaultOIDCScopes = []string{"openid", "profile", "groups"}
 
 // TokenCacheEntry stores a cached group resolution
 type TokenCacheEntry struct {
@@ -75,6 +98,28 @@ type App struct {
 	serverStates map[string]*ServerState
 	tokenCache   sync.Map // Token (string) -> *TokenCacheEntry
 	mu           sync.Mutex
+
+	// userInfoGroup deduplicates concurrent userinfo lookups for the same
+	// token (see FetchUserInfoGroups) so a burst of simultaneous requests
+	// sharing one cold cache entry - e.g. a page load's parallel asset
+	// requests - triggers at most one upstream call instead of tripping
+	// the OIDC provider's rate limit.
+	userInfoGroup singleflight.Group
+	// userInfoFailures short-circuits repeat userinfo calls for a token that
+	// just failed (e.g. the provider is rate-limiting us), so a steady
+	// trickle of sequential requests - which singleflight alone can't
+	// dedupe, since each arrives after the last one's Do call already
+	// completed - doesn't keep re-triggering the same failure indefinitely.
+	userInfoFailures sync.Map // token (string) -> *userInfoFailure
+}
+
+// userInfoFailureTTL is how long a failed userinfo lookup is remembered so
+// callers back off instead of retrying immediately.
+const userInfoFailureTTL = 10 * time.Second
+
+type userInfoFailure struct {
+	err error
+	at  time.Time
 }
 
 // RegisterFeature adds a feature to the server config if it doesn't already exist
@@ -120,6 +165,10 @@ func (a *App) Provision(ctx caddy.Context) error {
 		}
 		if config.ClientMode == "confidential" && config.ClientSecret == "" {
 			return fmt.Errorf("client_secret is required when client_mode is 'confidential' (server %q)", name)
+		}
+
+		if len(config.Scopes) == 0 {
+			config.Scopes = append([]string{}, defaultOIDCScopes...)
 		}
 	}
 	return nil
@@ -220,16 +269,47 @@ func (a *App) GetServerState(ctx context.Context, serverName string) (*ServerSta
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
 		Endpoint:     provider.Endpoint(),
-		// ACO only embeds the "groups" claim in the ID token / userinfo response
-		// when the "groups" scope was requested (see pkg/token/generate.go,
-		// pkg/userinfo/handler.go in the autentico server repo). Without it,
-		// `allow groups` checks against a token-authenticated user always see
-		// an empty group list.
-		Scopes: []string{oidc.ScopeOpenID, "profile", "groups"},
+		// See ServerConfig.Scopes / defaultOIDCScopes.
+		Scopes: config.Scopes,
 	}
 	state.Verifier = provider.Verifier(&oidc.Config{ClientID: config.ClientID})
+	state.ExternalVerifier = provider.Verifier(&oidc.Config{SkipClientIDCheck: true})
+	state.ExternalVerifierAllowExpired = provider.Verifier(&oidc.Config{SkipClientIDCheck: true, SkipExpiryCheck: true})
 
 	return state, nil
+}
+
+// VerifyExternalIDToken locally verifies a foreign ID token (see
+// ServerState.ExternalVerifier) and extracts its groups/roles claims. No
+// network call is made beyond what the oidc package needs to keep the
+// provider's signing keys fresh (jwks), which it caches internally - unlike
+// FetchUserInfoGroups, this never calls the userinfo endpoint, which many
+// providers correctly reject an ID token against regardless of validity.
+//
+// expired is true when the token's signature/issuer check out but it has
+// simply timed out; err is non-nil only for a genuinely invalid token (bad
+// signature, wrong issuer, malformed) or one that isn't a JWT this
+// provider issued at all (e.g. an opaque external bearer token).
+func (a *App) VerifyExternalIDToken(ctx context.Context, state *ServerState, token string) (groups []string, expired bool, rawClaims map[string]interface{}, err error) {
+	idToken, verifyErr := state.ExternalVerifier.Verify(ctx, token)
+	if verifyErr != nil {
+		idToken, err = state.ExternalVerifierAllowExpired.Verify(ctx, token)
+		if err != nil {
+			return nil, false, nil, verifyErr
+		}
+		expired = true
+	}
+
+	rawClaims = make(map[string]interface{})
+	idToken.Claims(&rawClaims)
+
+	var claims struct {
+		Groups []string `json:"groups"`
+		Roles  []string `json:"roles"`
+	}
+	idToken.Claims(&claims)
+
+	return append(claims.Groups, claims.Roles...), expired, rawClaims, nil
 }
 
 // GetCachedGroups retrieves groups from the cache if not expired
@@ -250,6 +330,74 @@ func (a *App) SetCachedGroups(token string, groups []string, ttl time.Duration) 
 		Groups:    groups,
 		ExpiresAt: time.Now().Add(ttl),
 	})
+}
+
+// UserInfoResult holds the outcome of a resolved userinfo lookup.
+type UserInfoResult struct {
+	Subject   string
+	Groups    []string
+	RawClaims map[string]interface{}
+}
+
+// unmarshalClaimsError distinguishes a malformed userinfo response (our
+// bug/provider contract mismatch) from a failed or rejected upstream call
+// (invalid/expired token, network error, rate limit, ...) so callers can
+// respond with the right status code.
+type unmarshalClaimsError struct{ err error }
+
+func (e *unmarshalClaimsError) Error() string { return e.err.Error() }
+func (e *unmarshalClaimsError) Unwrap() error { return e.err }
+
+// FetchUserInfoGroups resolves the groups claim (folded together with the
+// access token's role claim, see accessTokenIdentity) from the OIDC
+// provider's userinfo endpoint, and caches it for ttl. Concurrent calls for
+// the same token are deduplicated via singleflight so only one upstream
+// request is made no matter how many requests race in on a cold cache.
+func (a *App) FetchUserInfoGroups(ctx context.Context, httpClient *http.Client, provider *oidc.Provider, token string, ttl time.Duration) (*UserInfoResult, error) {
+	if v, ok := a.userInfoFailures.Load(token); ok {
+		f := v.(*userInfoFailure)
+		if time.Since(f.at) < userInfoFailureTTL {
+			return nil, f.err
+		}
+		a.userInfoFailures.Delete(token)
+	}
+
+	v, err, _ := a.userInfoGroup.Do(token, func() (interface{}, error) {
+		oauth2Token := &oauth2.Token{
+			AccessToken: token,
+			TokenType:   "Bearer",
+		}
+		userInfo, err := provider.UserInfo(oidc.ClientContext(ctx, httpClient), oauth2.StaticTokenSource(oauth2Token))
+		if err != nil {
+			a.userInfoFailures.Store(token, &userInfoFailure{err: err, at: time.Now()})
+			return nil, err
+		}
+
+		rawClaims := make(map[string]interface{})
+		userInfo.Claims(&rawClaims)
+
+		var claims struct {
+			Groups []string `json:"groups"`
+		}
+		if err := userInfo.Claims(&claims); err != nil {
+			wrapped := &unmarshalClaimsError{err}
+			a.userInfoFailures.Store(token, &userInfoFailure{err: wrapped, at: time.Now()})
+			return nil, wrapped
+		}
+
+		groups := claims.Groups
+		if _, _, role := accessTokenIdentity(token); role != "" {
+			groups = append(groups, role)
+		}
+
+		a.SetCachedGroups(token, groups, ttl)
+
+		return &UserInfoResult{Subject: userInfo.Subject, Groups: groups, RawClaims: rawClaims}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*UserInfoResult), nil
 }
 
 // LookupUserGroups fetches user groups from the Autentico admin API
@@ -374,15 +522,8 @@ func (a *App) RegisterRedirectURI(ctx context.Context, serverName, callbackURL s
 	return nil
 }
 
-// requiredOIDCScopes are the scopes the OIDC client must have registered on ACO.
-// "groups" in particular gates the groups claim on the ID token / userinfo
-// response (see pkg/token/generate.go and pkg/userinfo/handler.go in the
-// autentico server) - without it, `allow groups` checks against a
-// token-authenticated user always see an empty group list.
-var requiredOIDCScopes = []string{"openid", "profile", "groups"}
-
 // ensureClientScopes checks the OIDC client's currently registered scopes against
-// requiredOIDCScopes and PUTs an update to add any that are missing, preserving
+// config.Scopes and PUTs an update to add any that are missing, preserving
 // whatever scopes were already there.
 func ensureClientScopes(client *http.Client, config *ServerConfig, clientID, currentScopes string, logger *zap.Logger, serverName string) {
 	have := strings.Fields(currentScopes)
@@ -393,7 +534,7 @@ func ensureClientScopes(client *http.Client, config *ServerConfig, clientID, cur
 
 	newScopes := append([]string{}, have...)
 	changed := false
-	for _, s := range requiredOIDCScopes {
+	for _, s := range config.Scopes {
 		if !haveSet[s] {
 			newScopes = append(newScopes, s)
 			changed = true
@@ -745,7 +886,7 @@ func (a *App) Start() error {
 								"client_name":    "Caddy Autentico Plugin",
 								"redirect_uris":  []string{placeholderRedirectURI},
 								"response_types": []string{"code"},
-								"scopes":         "openid profile email groups",
+								"scopes":         strings.Join(config.Scopes, " "),
 							}
 							if config.ClientMode == "confidential" {
 								createPayload["client_type"] = "confidential"
@@ -855,12 +996,13 @@ func parseAutenticoGlobal(d *caddyfile.Dispenser, existingVal any) (any, error) 
 					if sc.ClientMode != "pkce" && sc.ClientMode != "confidential" {
 						return nil, d.Errf("invalid client_mode %q, expected 'pkce' or 'confidential'", sc.ClientMode)
 					}
-				case "api_token", "API":
-					if d.Val() == "API" {
-						if !d.NextArg() || d.Val() != "token" {
-							return nil, d.Err("expected 'token' after 'API'")
-						}
+				case "scopes":
+					scopes := d.RemainingArgs()
+					if len(scopes) == 0 {
+						return nil, d.ArgErr()
 					}
+					sc.Scopes = scopes
+				case "api_token":
 					if !d.NextArg() {
 						return nil, d.ArgErr()
 					}

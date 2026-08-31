@@ -7,8 +7,10 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -41,12 +43,20 @@ type Policy struct {
 
 // Autentico implements an HTTP handler that validates requests with an Autentico service.
 type Autentico struct {
-	ServerName         string   `json:"server_name,omitempty"`
-	Policies           []Policy `json:"policies,omitempty"`
-	CallbackPath       string   `json:"callback_path,omitempty"`
-	CookieDomain       string   `json:"cookie_domain,omitempty"`
-	ErrorRespondBody   string   `json:"error_respond_body,omitempty"`
-	ErrorRespondStatus int      `json:"error_respond_status,omitempty"`
+	ServerName          string   `json:"server_name,omitempty"`
+	Policies            []Policy `json:"policies,omitempty"`
+	CallbackPath        string   `json:"callback_path,omitempty"`
+	CookieDomain        string   `json:"cookie_domain,omitempty"`
+	ErrorRespondBody    string   `json:"error_respond_body,omitempty"`
+	ErrorRespondStatus  int      `json:"error_respond_status,omitempty"`
+	IsExternal          bool     `json:"is_external,omitempty"`
+	ExternalTokenSource string   `json:"external_token_source,omitempty"`
+	ExternalCookieName  string   `json:"external_cookie_name,omitempty"`
+	// ExternalExcludeGlobs are path.Match glob patterns (e.g. "/api/*") that
+	// bypass the token check entirely when IsExternal is set - for paths an
+	// external service must serve without a token (health checks, public
+	// assets, etc).
+	ExternalExcludeGlobs []string `json:"external_exclude_globs,omitempty"`
 
 	app    *App
 	logger *zap.Logger
@@ -68,6 +78,12 @@ func (a *Autentico) Provision(ctx caddy.Context) error {
 
 	if a.CallbackPath == "" {
 		a.CallbackPath = "/oauth2/callback"
+	}
+
+	for _, pattern := range a.ExternalExcludeGlobs {
+		if _, err := path.Match(pattern, "/"); err != nil {
+			return fmt.Errorf("invalid external exclude glob %q: %v", pattern, err)
+		}
 	}
 
 	appIface, err := ctx.App("autentico")
@@ -107,6 +123,22 @@ func (a *Autentico) Provision(ctx caddy.Context) error {
 
 	if hasGroups {
 		a.app.RegisterFeature(a.ServerName, "groups")
+
+		// The "groups" claim on the userinfo response (used for token-based
+		// auth) is only populated when the "groups" scope was requested (see
+		// ServerConfig.Scopes) - without it, group rules always see an empty
+		// group list for token-authenticated users.
+		hasGroupsScope := false
+		for _, s := range a.app.Servers[a.ServerName].Scopes {
+			if s == "groups" {
+				hasGroupsScope = true
+				break
+			}
+		}
+		if !hasGroupsScope {
+			a.logger.Warn("policy uses group/groups rules but the 'groups' scope is not configured for this server; token-authenticated users will always have an empty group list",
+				zap.String("server", a.ServerName))
+		}
 	}
 	if hasMTLS {
 		a.app.RegisterFeature(a.ServerName, "mtls")
@@ -166,6 +198,17 @@ func accessTokenIdentity(token string) (sub, preferredUsername, role string) {
 	return claims.Subject, claims.PreferredUsername, claims.Role
 }
 
+// matchesExternalExclude reports whether urlPath matches any of the
+// configured external exclude globs.
+func (a Autentico) matchesExternalExclude(urlPath string) bool {
+	for _, pattern := range a.ExternalExcludeGlobs {
+		if ok, _ := path.Match(pattern, urlPath); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	callbackURL := ""
@@ -192,6 +235,10 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Handle OAuth2 callback
 	if r.URL.Path == a.CallbackPath {
 		return a.handleCallback(w, r, state, oauthConfig)
+	}
+
+	if a.IsExternal && a.matchesExternalExclude(r.URL.Path) {
+		return next.ServeHTTP(w, r)
 	}
 
 	// MTLS Validation logic
@@ -225,10 +272,24 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	// Extract Bearer token
 	token := ""
-	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
-		token = strings.TrimPrefix(authHeader, "Bearer ")
-	} else if cookie, err := r.Cookie("autentico_token"); err == nil {
-		token = cookie.Value
+	externalCookieFound := false
+	if a.IsExternal {
+		if a.ExternalTokenSource == "cookie" {
+			if cookie, err := r.Cookie(a.ExternalCookieName); err == nil {
+				token = cookie.Value
+				externalCookieFound = true
+			}
+		} else if a.ExternalTokenSource == "bearer" {
+			if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+				token = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+	} else {
+		if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if cookie, err := r.Cookie("autentico_token"); err == nil {
+			token = cookie.Value
+		}
 	}
 
 	tokenValid := token != ""
@@ -248,7 +309,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		authMethod = "missing_token"
 	}
 
-	if authMethod == "missing_token" {
+	if authMethod == "missing_token" && !a.IsExternal {
 		if a.ErrorRespondBody != "" {
 			w.WriteHeader(a.ErrorRespondStatus)
 			w.Write([]byte(a.ErrorRespondBody))
@@ -337,17 +398,67 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	} else if authMethod == "token" || authMethod == "both" {
 		// Use Token to fetch groups
 		var tokenGroups []string
+
+		tokenSub, tokenPreferredUsername, _ := accessTokenIdentity(token)
+		tokenUsername := tokenPreferredUsername
+		if tokenUsername == "" {
+			tokenUsername = tokenSub
+		}
+
 		if cachedGroups, ok := a.app.GetCachedGroups(token); ok {
 			tokenGroups = cachedGroups
-		} else {
-			// Fetch UserInfo from OIDC provider
-			oauth2Token := &oauth2.Token{
-				AccessToken: token,
-				TokenType:   "Bearer",
-			}
-			userInfo, err := state.Provider.UserInfo(oidc.ClientContext(r.Context(), state.HTTPClient), oauth2.StaticTokenSource(oauth2Token))
+		} else if a.IsExternal {
+			// External tokens (e.g. an ID token from the app autentico sits
+			// in front of) were issued to a different OAuth client, so
+			// verify them locally instead of calling this provider's
+			// userinfo endpoint - which many providers reject an ID token
+			// against regardless of validity - and distinguish "expired"
+			// from "genuinely invalid" while we're at it. There is no
+			// userinfo fallback: a token this provider didn't issue is
+			// simply invalid.
+			_, expired, rawClaims, err := a.app.VerifyExternalIDToken(r.Context(), state, token)
 			if err != nil {
+				a.logger.Warn("external token failed local verification", zap.Error(err))
+				authMethod = "invalid"
+				tokenValid = false
+				goto skip_token_processing
+			}
+
+			a.logger.Debug("verified external token locally",
+				zap.String("server", a.ServerName),
+				zap.Bool("expired", expired),
+				zap.Any("claims", rawClaims))
+
+			if expired {
+				authMethod = "expired"
+			}
+
+			// Other clients' tokens generally don't carry a groups/roles
+			// claim of their own (e.g. audiobookshelf's client doesn't), so
+			// resolve real group membership via the admin API instead,
+			// cached per username same as the MTLS path below.
+			groupCacheKey := fmt.Sprintf("external:%s:%s", tokenUsername, a.ServerName)
+			if cachedGroups, ok := a.app.GetCachedGroups(groupCacheKey); ok {
+				tokenGroups = cachedGroups
+			} else if fetchedGroups, err := a.app.LookupUserGroups(r.Context(), a.ServerName, tokenUsername); err != nil {
+				a.logger.Warn("failed to fetch user groups for external token", zap.Error(err), zap.String("username", tokenUsername))
+			} else {
+				tokenGroups = fetchedGroups
+				a.app.SetCachedGroups(groupCacheKey, tokenGroups, 5*time.Minute)
+			}
+
+			a.app.SetCachedGroups(token, tokenGroups, 5*time.Minute)
+		} else {
+			res, err := a.app.FetchUserInfoGroups(r.Context(), state.HTTPClient, state.Provider, token, 5*time.Minute)
+			if err != nil {
+				var unmarshalErr *unmarshalClaimsError
+				if errors.As(err, &unmarshalErr) {
+					a.logger.Error("failed to unmarshal userinfo claims", zap.Error(err))
+					return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("invalid userinfo response"))
+				}
+
 				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
+
 				// Token might be invalid/expired, clear cookie if it came from one
 				http.SetCookie(w, &http.Cookie{
 					Name:     "autentico_token",
@@ -359,42 +470,15 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid token"))
 			}
 
-			if rawClaims := make(map[string]interface{}); userInfo.Claims(&rawClaims) == nil {
-				a.logger.Debug("dumping token claims for group check",
-					zap.String("server", a.ServerName),
-					zap.String("subject", userInfo.Subject),
-					zap.Any("claims", rawClaims))
-			}
+			a.logger.Debug("dumping token claims for group check",
+				zap.String("server", a.ServerName),
+				zap.String("subject", res.Subject),
+				zap.Any("claims", res.RawClaims))
 
-			var claims struct {
-				Groups []string `json:"groups"`
-			}
-			if err := userInfo.Claims(&claims); err != nil {
-				a.logger.Error("failed to unmarshal userinfo claims", zap.Error(err))
-				return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("invalid userinfo response"))
-			}
-			tokenGroups = claims.Groups
-
-			// ACO's userinfo endpoint doesn't expose the user's role, only the
-			// access token's own claims do. Decode it directly (already proven
-			// valid by the successful userinfo call above) and fold the role in
-			// as an implicit group so `allow groups admin` matches on role as
-			// well as explicit group membership.
-			if _, _, role := accessTokenIdentity(token); role != "" {
-				tokenGroups = append(tokenGroups, role)
-			}
-
-			// Cache it
-			a.app.SetCachedGroups(token, tokenGroups, 5*time.Minute)
+			tokenGroups = res.Groups
 		}
 
-		tokenSub, tokenPreferredUsername, _ := accessTokenIdentity(token)
-		tokenUsername := tokenPreferredUsername
-		if tokenUsername == "" {
-			tokenUsername = tokenSub
-		}
-
-		if authMethod == "token" {
+		if authMethod == "token" || authMethod == "expired" {
 			groups = tokenGroups
 			username = tokenUsername
 			subject = tokenSub
@@ -437,10 +521,18 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 	}
 
-	// 3. Evaluate Policies
-	// If no policies exist, we should probably allow since it's just authentication.
-	// But let's check policies. First-match-wins logic. Default is deny if they fall through.
-	if len(a.Policies) > 0 {
+skip_token_processing:
+
+	// If external and token is missing or invalid, do not evaluate policies or reject.
+	if a.IsExternal && (authMethod == "missing_token" || authMethod == "invalid") {
+		if authMethod == "missing_token" {
+			authMethod = "unauthenticated"
+		}
+		// Bypass policy evaluation and let the request continue
+	} else if len(a.Policies) > 0 && !a.IsExternal {
+		// 3. Evaluate Policies
+		// If no policies exist, we should probably allow since it's just authentication.
+		// But let's check policies. First-match-wins logic. Default is deny if they fall through.
 		allowed := false
 		matched := false
 
@@ -511,23 +603,39 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 
 		if !allowed {
-			if a.ErrorRespondBody != "" {
-				w.WriteHeader(a.ErrorRespondStatus)
-				w.Write([]byte(a.ErrorRespondBody))
-				return nil
+			// Do not return Forbidden if external flag is set, instead just pass through
+			if a.IsExternal {
+				// We actually shouldn't hit this path because we bypass policies for missing/invalid token
+				// but just in case, we still don't want to interrupt flow for external tokens that fail policy checks
+				// Wait, if it IS external and the token IS valid, but it fails a policy... the user requested:
+				// "Yes skip the policy enforement, just extract the variables"
+				// So if IsExternal, we actually shouldn't evaluate policies at all.
+			} else {
+				if a.ErrorRespondBody != "" {
+					w.WriteHeader(a.ErrorRespondStatus)
+					w.Write([]byte(a.ErrorRespondBody))
+					return nil
+				}
+				return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("forbidden"))
 			}
-			return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("forbidden"))
 		}
 	}
 
 	// Expose the resolved identity so later directives (respond, templates,
-	// header, reverse_proxy header_up, etc.) can reference it via
-	// {http.vars.autentico.user}, {http.vars.autentico.groups}, and
-	// {http.vars.autentico.auth_method} - or as a single JSON object via
-	// {http.vars.autentico.json}.
-	caddyhttp.SetVar(r.Context(), "autentico.user", username)
-	caddyhttp.SetVar(r.Context(), "autentico.groups", strings.Join(groups, ","))
-	caddyhttp.SetVar(r.Context(), "autentico.auth_method", authMethod)
+	// header, reverse_proxy header_up, matcher expressions, etc.) can
+	// reference it via {http.auth.autentico.user}, {http.auth.autentico.groups},
+	// and {http.auth.autentico.method} - or as a single JSON object via
+	// {http.auth.autentico.json}.
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl.Set("http.auth.autentico.user", username)
+	repl.Set("http.auth.autentico.groups", strings.Join(groups, ","))
+	repl.Set("http.auth.autentico.method", authMethod)
+
+	if a.IsExternal {
+		repl.Set("http.auth.autentico.external", "true")
+	} else {
+		repl.Set("http.auth.autentico.external", "false")
+	}
 
 	jsonGroups := groups
 	if jsonGroups == nil {
@@ -537,15 +645,20 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		Subject    string   `json:"sub"`
 		User       string   `json:"user"`
 		Groups     []string `json:"groups"`
-		AuthMethod string   `json:"auth_method"`
+		AuthMethod string   `json:"method"`
+		External   bool     `json:"external"`
 	}{
 		Subject:    subject,
 		User:       username,
 		Groups:     jsonGroups,
 		AuthMethod: authMethod,
+		External:   a.IsExternal,
 	}
 	if identityJSON, err := json.Marshal(identity); err == nil {
-		caddyhttp.SetVar(r.Context(), "autentico.json", string(identityJSON))
+		repl.Set("http.auth.autentico.json", string(identityJSON))
+		if externalCookieFound {
+			a.logger.Debug("external cookie found, resolved user info", zap.String("cookie_name", a.ExternalCookieName), zap.ByteString("autentico.json", identityJSON))
+		}
 	} else {
 		a.logger.Warn("failed to marshal autentico identity", zap.Error(err))
 	}
@@ -684,9 +797,9 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 
 		if len(args) > 0 {
-			// First argument could be server_name, allow, deny, etc.
+			// First argument could be server_name, allow, deny, external, etc.
 			firstArg := args[0]
-			if firstArg != "allow" && firstArg != "deny" && firstArg != "require_all" && firstArg != "callback_path" && firstArg != "cookie_domain" && firstArg != "error_respond" {
+			if firstArg != "allow" && firstArg != "deny" && firstArg != "require_all" && firstArg != "callback_path" && firstArg != "cookie_domain" && firstArg != "error_respond" && firstArg != "external" {
 				a.ServerName = firstArg
 				args = args[1:]
 			}
@@ -700,6 +813,33 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("inline rule error: %v", err)
 				}
 				a.Policies = append(a.Policies, Policy{Rules: []Rule{rule}})
+			} else if action == "external" {
+				a.IsExternal = true
+				rest := args[1:]
+				if len(rest) == 0 {
+					return d.Errf("expected 'cookie <name>' or 'bearer' after 'external'")
+				}
+				a.ExternalTokenSource = rest[0]
+				rest = rest[1:]
+				if a.ExternalTokenSource == "cookie" {
+					if len(rest) == 0 {
+						return d.Errf("expected cookie name after 'external cookie'")
+					}
+					a.ExternalCookieName = rest[0]
+					rest = rest[1:]
+				} else if a.ExternalTokenSource != "bearer" {
+					return d.Errf("expected 'cookie <name>' or 'bearer' after 'external', got '%s'", a.ExternalTokenSource)
+				}
+				if len(rest) > 0 {
+					if rest[0] != "exclude" {
+						return d.Errf("unexpected argument after external directive: %s", rest[0])
+					}
+					rest = rest[1:]
+					if len(rest) == 0 {
+						return d.Errf("expected at least one glob after 'exclude'")
+					}
+					a.ExternalExcludeGlobs = append(a.ExternalExcludeGlobs, rest...)
+				}
 			} else {
 				return d.Errf("unrecognized inline argument: %s", action)
 			}
@@ -756,6 +896,41 @@ func (a *Autentico) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					a.ErrorRespondStatus = status
 				} else {
 					a.ErrorRespondStatus = 403 // Default to 403 Forbidden
+				}
+
+			case "external":
+				if !d.NextArg() {
+					return d.Errf("expected 'cookie <name>', 'bearer', or 'exclude <glob>' after 'external'")
+				}
+				mode := d.Val()
+				if mode == "exclude" {
+					globs := d.RemainingArgs()
+					if len(globs) == 0 {
+						return d.Errf("expected at least one glob after 'external exclude'")
+					}
+					a.ExternalExcludeGlobs = append(a.ExternalExcludeGlobs, globs...)
+					break
+				}
+
+				a.IsExternal = true
+				a.ExternalTokenSource = mode
+				if a.ExternalTokenSource == "cookie" {
+					if !d.NextArg() {
+						return d.Errf("expected cookie name after 'external cookie'")
+					}
+					a.ExternalCookieName = d.Val()
+				} else if a.ExternalTokenSource != "bearer" {
+					return d.Errf("expected 'cookie <name>' or 'bearer' after 'external', got '%s'", a.ExternalTokenSource)
+				}
+				if d.NextArg() {
+					if d.Val() != "exclude" {
+						return d.Errf("unexpected argument after external directive: %s", d.Val())
+					}
+					globs := d.RemainingArgs()
+					if len(globs) == 0 {
+						return d.Errf("expected at least one glob after 'exclude'")
+					}
+					a.ExternalExcludeGlobs = append(a.ExternalExcludeGlobs, globs...)
 				}
 
 			default:
