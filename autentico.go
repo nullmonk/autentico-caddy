@@ -273,6 +273,7 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Extract Bearer token
 	token := ""
 	externalCookieFound := false
+	fromCookie := false
 	if a.IsExternal {
 		if a.ExternalTokenSource == "cookie" {
 			if cookie, err := r.Cookie(a.ExternalCookieName); err == nil {
@@ -285,10 +286,11 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			}
 		}
 	} else {
-		if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
-			token = strings.TrimPrefix(authHeader, "Bearer ")
-		} else if cookie, err := r.Cookie("autentico_token"); err == nil {
+		if cookie, err := r.Cookie("autentico_token"); err == nil {
 			token = cookie.Value
+			fromCookie = true
+		} else if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
 		}
 	}
 
@@ -460,13 +462,15 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
 
 				// Token might be invalid/expired, clear cookie if it came from one
-				http.SetCookie(w, &http.Cookie{
-					Name:     "autentico_token",
-					Value:    "",
-					Path:     "/",
-					Expires:  time.Unix(0, 0),
-					HttpOnly: true,
-				})
+				if fromCookie {
+					http.SetCookie(w, &http.Cookie{
+						Name:     "autentico_token",
+						Value:    "",
+						Path:     "/",
+						Expires:  time.Unix(0, 0),
+						HttpOnly: true,
+					})
+				}
 				return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid token"))
 			}
 
