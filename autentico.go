@@ -460,9 +460,9 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
 
 				// Token might be invalid/expired, clear cookie if it came from one.
-				// Must match attributes used when setting autentico_token (Domain,
-				// Secure); a host-only clear leaves Domain cookies stuck and every
-				later request returns bare 401 instead of re-login.
+				// Must match attributes used when setting autentico_token (Domain +
+				// Secure). A host-only clear leaves Domain cookies stuck and every
+				// later request returns bare 401 instead of re-login.
 				http.SetCookie(w, &http.Cookie{
 					Name:     "autentico_token",
 					Value:    "",
