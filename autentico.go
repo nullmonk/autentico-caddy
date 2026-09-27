@@ -459,14 +459,26 @@ func (a Autentico) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 				a.logger.Warn("failed to fetch userinfo", zap.Error(err))
 
-				// Token might be invalid/expired, clear cookie if it came from one
+				// Token might be invalid/expired, clear cookie if it came from one.
+				// Must match attributes used when setting autentico_token (Domain +
+				// Secure). A host-only clear leaves Domain cookies stuck and every
+				// later request returns bare 401 instead of re-login.
 				http.SetCookie(w, &http.Cookie{
 					Name:     "autentico_token",
 					Value:    "",
 					Path:     "/",
+					Domain:   a.CookieDomain,
 					Expires:  time.Unix(0, 0),
+					MaxAge:   -1,
 					HttpOnly: true,
+					Secure:   scheme == "https",
 				})
+				// Browsers: bounce once so the next hop has no dead cookie and
+				// the missing-token path can start OAuth again.
+				if strings.Contains(r.Header.Get("Accept"), "text/html") {
+					http.Redirect(w, r, r.URL.RequestURI(), http.StatusFound)
+					return nil
+				}
 				return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid token"))
 			}
 
